@@ -59,3 +59,8 @@
 The structural v2 is a local refresh broker that serializes refresh-token
 rotation per account. That can reduce the risk inherent in multiple processes
 holding snapshots of one rotating chain.
+
+- Done: document the broker design, feasible modes, and upstream constraints in
+  `docs/refresh-broker.md`.
+- Remaining: implement strict lease mode if the project wants complete
+  refresh-token serialization without upstream Codex changes.

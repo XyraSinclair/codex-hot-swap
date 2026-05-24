@@ -13,10 +13,32 @@ from codex_hot_swap_lib import (  # noqa: E402
     format_percent,
     format_time,
     live_tabs,
+    load_json,
     load_config,
     quota_walled_account_info,
     wall_cache_path,
 )
+
+
+def age_label(epoch: float | int | None) -> str:
+    if not epoch:
+        return "missing"
+    import time
+
+    age = max(0, time.time() - float(epoch))
+    if age < 60:
+        return f"{age:.0f}s"
+    if age < 3600:
+        return f"{age / 60:.0f}m"
+    return f"{age / 3600:.1f}h"
+
+
+def is_stale(epoch: float | int | None, max_age: float) -> bool:
+    if not epoch:
+        return True
+    import time
+
+    return time.time() - float(epoch) > max_age
 
 
 def main() -> int:
@@ -25,6 +47,15 @@ def main() -> int:
     states = account_states(home, config)
     walls = quota_walled_account_info(home, config)
     tabs = live_tabs(home)
+    predictive = load_json(home / "predictive_state.json", {})
+    wall_raw = load_json(wall_cache_path(home), {})
+    predictive_written = predictive.get("written_at") if isinstance(predictive, dict) else None
+    wall_written = wall_raw.get("written_at") if isinstance(wall_raw, dict) else None
+    daemon_stale = is_stale(
+        predictive_written,
+        max(float(config.get("poll_interval_seconds", 60)) * 3, 180),
+    )
+    wall_stale = is_stale(wall_written, float(config.get("quota_wall_max_age_seconds", 300)))
 
     print(f"Codex Hot Swap status")
     print(f"CODEX_HOME: {home}")
@@ -33,6 +64,18 @@ def main() -> int:
         + ("enabled" if config.get("refresh_codex_auth_usage") else "disabled")
         + f" | wall cache: {wall_cache_path(home)}"
     )
+    print(
+        "daemon: "
+        + ("stale" if daemon_stale else "fresh")
+        + f" age={age_label(predictive_written)}"
+        + f" | wall-cache: {'stale' if wall_stale else 'fresh'} age={age_label(wall_written)}"
+    )
+    if isinstance(predictive, dict) and predictive:
+        print(
+            "default switch: "
+            + str(predictive.get("global_switch_reason", "unknown"))
+            + f" target={predictive.get('selected_default_email', '-')}"
+        )
     print()
 
     if not states:
@@ -48,6 +91,18 @@ def main() -> int:
                 flags.append("broken")
             if state.email.lower() in walls:
                 flags.append("walled")
+            low_5h = (
+                state.remaining_5h is not None
+                and state.remaining_5h <= float(config.get("threshold_5h_percent", 25))
+            )
+            low_weekly = (
+                state.remaining_weekly is not None
+                and state.remaining_weekly <= float(config.get("threshold_weekly_percent", 15))
+            )
+            if low_5h or low_weekly:
+                flags.append("low")
+            if state.remaining_5h is None and state.remaining_weekly is None:
+                flags.append("unknown")
             if not flags:
                 flags.append("ok")
             print(

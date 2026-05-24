@@ -50,6 +50,11 @@ if [ "${FAKE_CODEX_OUTPUT:-}" != "" ]; then
   printf '%s\n' "$FAKE_CODEX_OUTPUT"
 fi
 
+if [ "${FAKE_CODEX_TOUCH_PATH:-}" != "" ]; then
+  printf '{}\n' > "$FAKE_CODEX_TOUCH_PATH"
+  touch "$FAKE_CODEX_TOUCH_PATH"
+fi
+
 sleep_for="${FAKE_CODEX_SLEEP:-0}"
 if [[ "$*" == *"automatically migrated"* ]]; then
   sleep_for="${FAKE_CODEX_MIGRATED_SLEEP:-$sleep_for}"

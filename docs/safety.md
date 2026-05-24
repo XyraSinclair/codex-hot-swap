@@ -27,6 +27,10 @@ Required defenses:
 - stale-snapshot detection before marking an account broken;
 - browser OAuth as the clear repair path for truly dead chains.
 
+These are v1 mitigations. Full serialization of refresh-token rotation requires
+a refresh broker or a strict account lease mode. See
+[`refresh-broker.md`](refresh-broker.md).
+
 ## Usage API Risk
 
 Usage polling is the only authoritative quota source, but excessive polling may

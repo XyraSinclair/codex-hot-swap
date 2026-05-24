@@ -52,6 +52,12 @@ fake_log="$sandbox/fake-codex.log"
 PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" FAKE_CODEX_LOG="$fake_log" ./bin/codex-safe login >/dev/null
 grep -q "argv=login" "$fake_log"
 grep -q "home=$wrapper_home" "$fake_log"
+: >"$fake_log"
+PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" FAKE_CODEX_LOG="$fake_log" ./bin/codex-safe mcp list >/dev/null
+grep -q "argv=mcp list" "$fake_log"
+: >"$fake_log"
+PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" FAKE_CODEX_LOG="$fake_log" ./bin/codex-safe completion zsh >/dev/null
+grep -q "argv=completion zsh" "$fake_log"
 
 : >"$fake_log"
 PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" CODEX_HOTSWAP_KEEP_TABS=1 FAKE_CODEX_LOG="$fake_log" ./bin/codex-safe "hello" >/dev/null
@@ -157,6 +163,67 @@ rm -f "$wrapper_home/accounts/recover/broken.tsv"
 PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" CODEX_HOTSWAP_KEEP_TABS=1 FAKE_CODEX_LOG="$fake_log" FAKE_CODEX_OUTPUT="You've hit your usage limit" ./bin/codex-safe "hello" >/dev/null
 test ! -e "$wrapper_home/accounts/recover/broken.tsv"
 
+: >"$fake_log"
+if PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" FAKE_CODEX_LOG="$fake_log" FAKE_CODEX_EXIT=42 ./bin/codex-safe "hello" >/dev/null; then
+  echo "codex-safe unexpectedly succeeded for child exit 42" >&2
+  exit 1
+else
+  code=$?
+  test "$code" -eq 42
+fi
+
+: >"$fake_log"
+PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" FAKE_CODEX_LOG="$fake_log" FAKE_CODEX_OUTPUT="refresh token was revoked" FAKE_CODEX_EXIT=0 ./bin/codex-safe "hello" >/dev/null
+test ! -e "$wrapper_home/accounts/recover/broken.tsv"
+
+stale_auth_home="$sandbox/stale-auth-home"
+mkdir -p "$stale_auth_home/accounts"
+cat >"$stale_auth_home/accounts/registry.json" <<'JSON'
+{
+  "accounts": {
+    "a": {
+      "email": "a@example.com",
+      "auth_path": "a.auth.json",
+      "usage": {
+        "5h": {"used_percent": 10},
+        "weekly": {"used_percent": 10}
+      }
+    }
+  }
+}
+JSON
+printf '{}\n' >"$stale_auth_home/accounts/a.auth.json"
+: >"$fake_log"
+if PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$stale_auth_home" FAKE_CODEX_LOG="$fake_log" FAKE_CODEX_OUTPUT="refresh token was revoked" FAKE_CODEX_EXIT=1 FAKE_CODEX_TOUCH_PATH="$stale_auth_home/accounts/a.auth.json" ./bin/codex-safe "hello" >/dev/null; then
+  echo "stale auth retry unexpectedly succeeded" >&2
+  exit 1
+fi
+test ! -e "$stale_auth_home/accounts/recover/broken.tsv"
+
+broken_auth_home="$sandbox/broken-auth-home"
+mkdir -p "$broken_auth_home/accounts"
+cat >"$broken_auth_home/accounts/registry.json" <<'JSON'
+{
+  "accounts": {
+    "a": {
+      "email": "a@example.com",
+      "auth_path": "a.auth.json",
+      "usage": {
+        "5h": {"used_percent": 10},
+        "weekly": {"used_percent": 10}
+      }
+    }
+  }
+}
+JSON
+printf '{}\n' >"$broken_auth_home/accounts/a.auth.json"
+: >"$fake_log"
+if PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$broken_auth_home" FAKE_CODEX_LOG="$fake_log" FAKE_CODEX_OUTPUT="refresh token was revoked" FAKE_CODEX_EXIT=1 ./bin/codex-safe "hello" >/dev/null; then
+  echo "broken auth retry unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q "a@example.com" "$broken_auth_home/accounts/recover/broken.tsv"
+
 rollout_dir="$wrapper_home/sessions/2026/05/24"
 mkdir -p "$rollout_dir"
 rollout="$rollout_dir/rollout-test.jsonl"
@@ -168,6 +235,7 @@ prompt_out="$sandbox/transfer-prompt.out"
 CODEX_HOME="$wrapper_home" ./bin/codex-continue "$rollout" --print >"$prompt_out"
 grep -q "automatically migrated" "$prompt_out"
 grep -q "Please continue the work" "$prompt_out"
+grep -q "I will inspect the repo next" "$prompt_out"
 
 : >"$fake_log"
 PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" FAKE_CODEX_LOG="$fake_log" ./bin/codex-validate --to a@example.com >/dev/null
@@ -317,6 +385,139 @@ auth_log="$sandbox/codex-auth.log"
 PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" FAKE_CODEX_AUTH_LOG="$auth_log" FAKE_CODEX_AUTH_FAIL_IF_CALLED=1 ./bin/codex-predictive-daemon --once
 test ! -e "$auth_log"
 
+tolerance_home="$sandbox/tolerance-home"
+mkdir -p "$tolerance_home/accounts"
+cat >"$tolerance_home/accounts/registry.json" <<'JSON'
+{
+  "accounts": {
+    "a": {
+      "email": "a@example.com",
+      "auth_path": "a.auth.json",
+      "usage": {
+        "5h": {"used_percent": 20},
+        "weekly": {"used_percent": 20}
+      }
+    },
+    "b": {
+      "email": "b@example.com",
+      "auth_path": "b.auth.json",
+      "usage": {
+        "5h": {"used_percent": 17},
+        "weekly": {"used_percent": 17}
+      }
+    }
+  }
+}
+JSON
+printf '{}\n' >"$tolerance_home/accounts/a.auth.json"
+printf '{}\n' >"$tolerance_home/accounts/b.auth.json"
+cat >"$tolerance_home/codex-hotswap.json" <<'JSON'
+{
+  "switch_default": true,
+  "refresh_codex_auth_usage": false,
+  "load_balance_tolerance_pct": 15
+}
+JSON
+cat >"$tolerance_home/predictive_state.json" <<'JSON'
+{
+  "written_at": 1,
+  "selected_default_email": "a@example.com"
+}
+JSON
+tolerance_auth_log="$sandbox/tolerance-codex-auth.log"
+PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$tolerance_home" FAKE_CODEX_AUTH_LOG="$tolerance_auth_log" FAKE_CODEX_AUTH_FAIL_IF_CALLED=1 ./bin/codex-predictive-daemon --once
+test ! -e "$tolerance_auth_log"
+grep -q '"global_switch_reason": "within-tolerance"' "$tolerance_home/predictive_state.json"
+grep -q '"selected_default_email": "a@example.com"' "$tolerance_home/predictive_state.json"
+
+status_home="$sandbox/status-home"
+mkdir -p "$status_home/accounts/recover"
+cat >"$status_home/accounts/registry.json" <<'JSON'
+{
+  "accounts": {
+    "low": {
+      "email": "low@example.com",
+      "auth_path": "low.auth.json",
+      "usage": {
+        "5h": {"used_percent": 90},
+        "weekly": {"used_percent": 10}
+      }
+    },
+    "unknown": {
+      "email": "unknown@example.com",
+      "auth_path": "unknown.auth.json"
+    },
+    "broken": {
+      "email": "broken@example.com",
+      "auth_path": "broken.auth.json",
+      "usage": {
+        "5h": {"used_percent": 10},
+        "weekly": {"used_percent": 10}
+      }
+    },
+    "missing": {
+      "email": "missing@example.com",
+      "auth_path": "missing.auth.json",
+      "usage": {
+        "5h": {"used_percent": 10},
+        "weekly": {"used_percent": 10}
+      }
+    },
+    "walled": {
+      "email": "walled@example.com",
+      "auth_path": "walled.auth.json",
+      "usage": {
+        "5h": {"used_percent": 100},
+        "weekly": {"used_percent": 100}
+      }
+    }
+  }
+}
+JSON
+for account in low unknown broken walled; do
+  printf '{}\n' >"$status_home/accounts/$account.auth.json"
+done
+printf 'broken@example.com\t1\n' >"$status_home/accounts/recover/broken.tsv"
+cat >"$status_home/predictive_state.json" <<'JSON'
+{
+  "written_at": 1,
+  "global_switch_reason": "within-tolerance",
+  "selected_default_email": "low@example.com"
+}
+JSON
+cat >"$status_home/predictive_quota_walls.json" <<JSON
+{
+  "written_at": $(python3 - <<'PY'
+import time
+print(time.time())
+PY
+),
+  "accounts": {
+    "walled@example.com": {
+      "email": "walled@example.com",
+      "windows": {
+        "weekly": {
+          "remaining_percent": 0,
+          "resets_at": $(python3 - <<'PY'
+import time
+print(time.time() + 3600)
+PY
+)
+        }
+      }
+    }
+  }
+}
+JSON
+CODEX_HOME="$status_home" ./bin/codex-status >"$sandbox/status.out"
+grep -q "daemon: stale" "$sandbox/status.out"
+grep -q "wall-cache: fresh" "$sandbox/status.out"
+grep -q "low@example.com.*low" "$sandbox/status.out"
+grep -q "unknown@example.com.*unknown" "$sandbox/status.out"
+grep -q "broken@example.com.*broken" "$sandbox/status.out"
+grep -q "missing@example.com.*missing-vault" "$sandbox/status.out"
+grep -q "walled@example.com.*walled" "$sandbox/status.out"
+
 migrate_home="$sandbox/migrate-home"
 mkdir -p "$migrate_home/accounts" "$migrate_home/sessions"
 cat >"$migrate_home/accounts/registry.json" <<'JSON'
@@ -406,6 +607,13 @@ test -x "$sandbox/home/bin/codex-validate"
 test -f "$sandbox/home/codex/codex-hotswap.json"
 test ! -e "$sandbox/home/.zshrc"
 test ! -e "$sandbox/home/Library/LaunchAgents"
+printf '{"custom": true}\n' >"$sandbox/home/codex/codex-hotswap.json"
+HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh >"$sandbox/install-again.out"
+grep -q '"custom": true' "$sandbox/home/codex/codex-hotswap.json"
+HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --with-alias >"$sandbox/install-alias.out"
+grep -q "alias codex='codex-safe'" "$sandbox/home/.zshrc"
+HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --with-alias >"$sandbox/install-alias-again.out"
+test "$(grep -c "alias codex='codex-safe'" "$sandbox/home/.zshrc")" -eq 1
 
 plist="$sandbox/rendered.plist"
 HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" CODEX_HOTSWAP_LAUNCHD_LABEL="dev.codex-hot-swap.test" ./install.sh --render-launchd-plist "$plist" >"$sandbox/render-plist.out"

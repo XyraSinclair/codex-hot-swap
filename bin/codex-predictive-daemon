@@ -15,6 +15,7 @@ from codex_hot_swap_lib import (  # noqa: E402
     account_states,
     codex_home,
     live_tabs,
+    load_json,
     load_config,
     pick_account,
     quota_walled_emails,
@@ -24,19 +25,44 @@ from codex_hot_swap_lib import (  # noqa: E402
 )
 
 
-def maybe_switch_default(home: Path, config: dict, states) -> bool:
+def maybe_switch_default(home: Path, config: dict, states) -> dict:
     if not config.get("switch_default", False):
-        return False
+        return {"performed": False, "reason": "disabled", "target": None}
     if live_tabs(home):
-        return False
+        return {"performed": False, "reason": "live-tabs", "target": None}
     walled = quota_walled_emails(home, config)
     target = pick_account(states, config, walled=walled)
     if target is None:
-        return False
+        return {"performed": False, "reason": "no-usable-account", "target": None}
+
+    previous = load_json(home / "predictive_state.json", {})
+    previous_email = None
+    if isinstance(previous, dict):
+        previous_email = previous.get("selected_default_email")
+    if isinstance(previous_email, str) and previous_email.lower() != target.email.lower():
+        current = next(
+            (state for state in states if state.email.lower() == previous_email.lower()),
+            None,
+        )
+        tolerance = float(config.get("load_balance_tolerance_pct", 15) or 0)
+        if (
+            current is not None
+            and current.auth_exists
+            and not current.broken
+            and current.email.lower() not in walled
+            and target.usable_remaining - current.usable_remaining < tolerance
+        ):
+            return {
+                "performed": False,
+                "reason": "within-tolerance",
+                "target": current.email,
+                "candidate": target.email,
+            }
+
     env = dict(os.environ)
     env["CODEX_HOME"] = str(home)
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["codex-auth", "switch", target.email],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -45,9 +71,15 @@ def maybe_switch_default(home: Path, config: dict, states) -> bool:
             timeout=60,
             check=False,
         )
-        return True
+        if result.returncode == 0:
+            return {"performed": True, "reason": "switched", "target": target.email}
+        return {
+            "performed": False,
+            "reason": f"codex-auth-exit-{result.returncode}",
+            "target": target.email,
+        }
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
+        return {"performed": False, "reason": "codex-auth-unavailable", "target": target.email}
 
 
 def tick(home: Path, once: bool = False) -> None:
@@ -55,7 +87,7 @@ def tick(home: Path, once: bool = False) -> None:
     refreshed = run_usage_refresh_if_enabled(home, config)
     states = account_states(home, config)
     walls = write_quota_wall_cache(home, states)
-    switched = maybe_switch_default(home, config, states)
+    switch = maybe_switch_default(home, config, states)
     write_json_atomic(
         home / "predictive_state.json",
         {
@@ -64,7 +96,10 @@ def tick(home: Path, once: bool = False) -> None:
             "usage_refresh_attempted": bool(config.get("refresh_codex_auth_usage")),
             "usage_refreshed": refreshed,
             "global_switch_attempted": bool(config.get("switch_default", False)),
-            "global_switch_performed": switched,
+            "global_switch_performed": bool(switch.get("performed")),
+            "global_switch_reason": switch.get("reason"),
+            "selected_default_email": switch.get("target"),
+            "candidate_default_email": switch.get("candidate"),
             "account_count": len(states),
             "wall_count": len(walls.get("accounts", {})),
             "live_tab_count": len(live_tabs(home)),

@@ -177,7 +177,7 @@ def run_interactive(argv: list[str], excluded: set[str] | None = None) -> int:
         last_output = time.time()
         last_wall_poll = 0.0
         should_migrate = False
-        exit_code = 0
+        exit_code: int | None = None
 
         try:
             while True:
@@ -209,6 +209,8 @@ def run_interactive(argv: list[str], excluded: set[str] | None = None) -> int:
                         exit_code = os.WEXITSTATUS(status)
                     elif os.WIFSIGNALED(status):
                         exit_code = 128 + os.WTERMSIG(status)
+                    else:
+                        exit_code = 1
                     break
 
                 if os.environ.get("CODEX_SAFE_NO_AUTO_QUOTA_MIGRATE"):
@@ -236,6 +238,18 @@ def run_interactive(argv: list[str], excluded: set[str] | None = None) -> int:
                     termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_term)
             with contextlib.suppress(OSError):
                 os.close(master_fd)
+
+        if exit_code is None:
+            try:
+                _done, status = os.waitpid(pid, 0)
+                if os.WIFEXITED(status):
+                    exit_code = os.WEXITSTATUS(status)
+                elif os.WIFSIGNALED(status):
+                    exit_code = 128 + os.WTERMSIG(status)
+                else:
+                    exit_code = 1
+            except ChildProcessError:
+                exit_code = 0 if not should_migrate else 75
 
         write_tab_state(
             tab_home,
