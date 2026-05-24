@@ -1,0 +1,22 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.log
+tmp/
+
+# Local Codex credentials and state.
+auth.json
+*.auth.json
+registry.json
+accounts/
+tabs/
+sessions/
+state*.sqlite
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+predictive_state.json
+predictive_warning_state.json
+predictive_quota_walls.json
+predictive_redundancy_warning_state.json
+broken.tsv

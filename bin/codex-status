@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+from codex_hot_swap_lib import (  # noqa: E402
+    account_states,
+    codex_home,
+    format_percent,
+    format_time,
+    live_tabs,
+    load_config,
+    quota_walled_account_info,
+    wall_cache_path,
+)
+
+
+def main() -> int:
+    home = codex_home()
+    config = load_config(home)
+    states = account_states(home, config)
+    walls = quota_walled_account_info(home, config)
+    tabs = live_tabs(home)
+
+    print(f"Codex Hot Swap status")
+    print(f"CODEX_HOME: {home}")
+    print(
+        "usage refresh: "
+        + ("enabled" if config.get("refresh_codex_auth_usage") else "disabled")
+        + f" | wall cache: {wall_cache_path(home)}"
+    )
+    print()
+
+    if not states:
+        print("No accounts found in registry.")
+    else:
+        print("Accounts")
+        print("email                         5h       weekly   live  state")
+        for state in sorted(states, key=lambda item: item.email.lower()):
+            flags = []
+            if not state.auth_exists:
+                flags.append("missing-vault")
+            if state.broken:
+                flags.append("broken")
+            if state.email.lower() in walls:
+                flags.append("walled")
+            if not flags:
+                flags.append("ok")
+            print(
+                f"{state.email[:29]:29} "
+                f"{format_percent(state.remaining_5h):8} "
+                f"{format_percent(state.remaining_weekly):8} "
+                f"{state.live_tabs:<5} "
+                f"{','.join(flags)}"
+            )
+
+    print()
+    print("Quota walls")
+    if not walls:
+        print("none")
+    else:
+        for email, info in sorted(walls.items()):
+            windows = []
+            for name, entry in info["windows"].items():
+                windows.append(f"{name} resets {format_time(entry.get('resets_at'))}")
+            print(f"{email}: {', '.join(windows)}")
+
+    print()
+    print("Live tabs")
+    if not tabs:
+        print("none")
+    else:
+        for tab in tabs:
+            print(
+                f"{tab.get('tab_id', '?')} "
+                f"{tab.get('email', '?')} "
+                f"child={tab.get('child_pid', '-')} "
+                f"status={tab.get('status', '-')}"
+            )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

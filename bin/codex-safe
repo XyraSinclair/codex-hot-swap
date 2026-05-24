@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import contextlib
+import os
+import pty
+import select
+import signal
+import sys
+import termios
+import time
+import tty
+from collections import deque
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+from codex_hot_swap_lib import (  # noqa: E402
+    account_states,
+    build_transfer_prompt,
+    cleanup_tab_home,
+    codex_home,
+    create_tab_home,
+    latest_rollout_from_sqlite,
+    load_config,
+    mark_broken,
+    output_has_auth_failure,
+    pick_account,
+    quota_walled_emails,
+    sync_tab_auth_to_vault,
+    tab_auth_is_stale_against_vault,
+    write_tab_state,
+)
+
+PASS_THROUGH_COMMANDS = {
+    "login",
+    "logout",
+    "mcp",
+    "plugin",
+    "mcp-server",
+    "app-server",
+    "remote-control",
+    "app",
+    "completion",
+    "update",
+    "doctor",
+    "sandbox",
+    "debug",
+    "apply",
+    "resume",
+    "fork",
+    "cloud",
+    "exec",
+    "review",
+}
+
+
+def first_command(argv: list[str]) -> str | None:
+    for item in argv:
+        if item == "--":
+            return None
+        if item.startswith("-"):
+            continue
+        return item
+    return None
+
+
+def exec_codex(argv: list[str], env: dict[str, str]) -> None:
+    os.execvpe("codex", ["codex", *argv], env)
+
+
+def print_banner(message: str) -> None:
+    os.write(1, f"\n[codex-hot-swap] {message}\n".encode())
+
+
+def terminate_child(pid: int) -> None:
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.time() + 4
+    while time.time() < deadline:
+        try:
+            done, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if done:
+            return
+        time.sleep(0.1)
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    with contextlib.suppress(ChildProcessError):
+        os.waitpid(pid, 0)
+
+
+def migration_reason_for(email: str, home: Path, config: dict) -> str | None:
+    lowered = email.lower()
+    if lowered in quota_walled_emails(home, config):
+        return "quota-walled"
+
+    threshold_5h = float(config.get("live_migrate_below_5h_percent", 0) or 0)
+    threshold_weekly = float(config.get("live_migrate_below_weekly_percent", 0) or 0)
+    if threshold_5h <= 0 and threshold_weekly <= 0:
+        return None
+
+    for state in account_states(home, config):
+        if state.email.lower() != lowered:
+            continue
+        if threshold_5h > 0 and state.remaining_5h is not None and state.remaining_5h <= threshold_5h:
+            return f"5h quota at {state.remaining_5h:.0f}%"
+        if (
+            threshold_weekly > 0
+            and state.remaining_weekly is not None
+            and state.remaining_weekly <= threshold_weekly
+        ):
+            return f"weekly quota at {state.remaining_weekly:.0f}%"
+    return None
+
+
+def run_interactive(argv: list[str], excluded: set[str] | None = None) -> int:
+    home = codex_home()
+    config = load_config(home)
+    excluded = {item.lower() for item in (excluded or set())}
+    migrations = 0
+    prompt_override: str | None = None
+
+    while True:
+        states = account_states(home, config)
+        walled = quota_walled_emails(home, config)
+        account = pick_account(states, config, excluded=excluded, walled=walled)
+        if account is None:
+            print_banner("no usable account is available; leaving control with the shell")
+            return 75
+
+        tab_id, tab_home = create_tab_home(home, account)
+        child_argv = list(argv)
+        if prompt_override:
+            child_argv.append(prompt_override)
+
+        env = dict(os.environ)
+        env["CODEX_HOME"] = str(tab_home)
+        env["CODEX_HOTSWAP_TAB_ID"] = tab_id
+        env["CODEX_HOTSWAP_PINNED_EMAIL"] = account.email
+
+        pid, master_fd = pty.fork()
+        if pid == 0:
+            exec_codex(child_argv, env)
+
+        write_tab_state(
+            tab_home,
+            tab_id=tab_id,
+            account=account,
+            argv=child_argv,
+            wrapper_pid=os.getpid(),
+            child_pid=pid,
+            status="running",
+            migrations=migrations,
+        )
+
+        old_term = None
+        if sys.stdin.isatty():
+            old_term = termios.tcgetattr(sys.stdin.fileno())
+            tty.setraw(sys.stdin.fileno())
+
+        ring: deque[str] = deque(maxlen=200)
+        last_output = time.time()
+        last_wall_poll = 0.0
+        should_migrate = False
+        exit_code = 0
+
+        try:
+            while True:
+                ready, _, _ = select.select([master_fd, sys.stdin.fileno()], [], [], 0.25)
+                if master_fd in ready:
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except OSError:
+                        data = b""
+                    if data:
+                        last_output = time.time()
+                        with contextlib.suppress(OSError):
+                            os.write(sys.stdout.fileno(), data)
+                        ring.append(data.decode(errors="replace"))
+                    else:
+                        break
+                if sys.stdin.fileno() in ready:
+                    data = os.read(sys.stdin.fileno(), 4096)
+                    if data:
+                        with contextlib.suppress(OSError):
+                            os.write(master_fd, data)
+
+                try:
+                    done, status = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    done, status = pid, 0
+                if done:
+                    if os.WIFEXITED(status):
+                        exit_code = os.WEXITSTATUS(status)
+                    elif os.WIFSIGNALED(status):
+                        exit_code = 128 + os.WTERMSIG(status)
+                    break
+
+                if os.environ.get("CODEX_SAFE_NO_AUTO_QUOTA_MIGRATE"):
+                    continue
+                clock = time.time()
+                if clock - last_wall_poll < 2:
+                    continue
+                last_wall_poll = clock
+                config = load_config(home)
+                if migrations >= int(config.get("max_live_migrations_per_tab", 4)):
+                    continue
+                idle_seconds = float(config.get("live_migrate_idle_seconds", 2))
+                if clock - last_output < idle_seconds:
+                    continue
+                reason = migration_reason_for(account.email, home, config)
+                if reason:
+                    should_migrate = True
+                    print_banner(f"{account.email} is {reason}; migrating this tab")
+                    terminate_child(pid)
+                    exit_code = 75
+                    break
+        finally:
+            if old_term is not None:
+                with contextlib.suppress(termios.error):
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_term)
+            with contextlib.suppress(OSError):
+                os.close(master_fd)
+
+        write_tab_state(
+            tab_home,
+            tab_id=tab_id,
+            account=account,
+            argv=child_argv,
+            wrapper_pid=os.getpid(),
+            child_pid=None,
+            status="migrating" if should_migrate else "exited",
+            migrations=migrations,
+        )
+
+        with contextlib.suppress(Exception):
+            sync_tab_auth_to_vault(tab_home, account)
+
+        output = "".join(ring)
+        if should_migrate:
+            excluded.add(account.email.lower())
+            rollout = latest_rollout_from_sqlite(tab_home)
+            prompt_override = (
+                build_transfer_prompt(rollout)
+                if rollout is not None
+                else "This Codex chat was automatically migrated after a quota wall. No rollout could be reconstructed; ask the user one concise question if needed."
+            )
+            migrations += 1
+            cleanup_tab_home(tab_home)
+            continue
+
+        if exit_code != 0 and output_has_auth_failure(output):
+            if tab_auth_is_stale_against_vault(tab_home, account):
+                print_banner(f"{account.email} tab auth was stale; retrying with fresh vault")
+            else:
+                print_banner(f"{account.email} auth chain appears broken; excluding it")
+                mark_broken(home, account.email)
+            excluded.add(account.email.lower())
+            migrations += 1
+            cleanup_tab_home(tab_home)
+            continue
+
+        if exit_code == 0:
+            cleanup_tab_home(tab_home)
+        return exit_code
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--hotswap-help", action="store_true")
+    known, remainder = parser.parse_known_args()
+    if known.hotswap_help or remainder in (["--help"], ["-h"]):
+        print("Usage: codex-safe [codex options] [prompt]")
+        print("Passes management subcommands through to codex.")
+        print("Set CODEX_SAFE_DISABLE=1 to bypass the wrapper.")
+        print("Set CODEX_SAFE_NO_AUTO_QUOTA_MIGRATE=1 to disable live migration.")
+        return 0
+
+    argv = remainder
+    command = first_command(argv)
+    if os.environ.get("CODEX_SAFE_DISABLE") or command in PASS_THROUGH_COMMANDS:
+        exec_codex(argv, dict(os.environ))
+    return run_interactive(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

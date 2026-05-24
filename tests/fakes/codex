@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log="${FAKE_CODEX_LOG:?FAKE_CODEX_LOG required}"
+printf 'argv=%s\n' "$*" >> "$log"
+printf 'home=%s\n' "${CODEX_HOME:-}" >> "$log"
+
+if [ "${FAKE_CODEX_OUTPUT:-}" != "" ]; then
+  printf '%s\n' "$FAKE_CODEX_OUTPUT"
+fi
+
+if [ "${FAKE_CODEX_SLEEP:-0}" != "0" ]; then
+  sleep "$FAKE_CODEX_SLEEP"
+fi
+
+exit "${FAKE_CODEX_EXIT:-0}"
