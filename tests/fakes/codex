@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+  case "${FAKE_CODEX_HELP_MODE:-modern}" in
+    modern)
+      echo "Usage: codex [OPTIONS] [PROMPT]"
+      ;;
+    no-prompt)
+      echo "Usage: codex [OPTIONS]"
+      ;;
+    *)
+      printf '%s\n' "$FAKE_CODEX_HELP_MODE"
+      ;;
+  esac
+  exit 0
+fi
+
 log="${FAKE_CODEX_LOG:?FAKE_CODEX_LOG required}"
 printf 'argv=%s\n' "$*" >> "$log"
 printf 'home=%s\n' "${CODEX_HOME:-}" >> "$log"

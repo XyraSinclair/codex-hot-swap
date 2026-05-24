@@ -12,6 +12,7 @@ This checklist defines what "shippable" means for Codex Hot Swap.
 - Optional alias install is gated behind `--with-alias`.
 - Re-running install is idempotent and does not overwrite user config.
 - Uninstall instructions are printed after install.
+- Launchd plist rendering can be tested without bootstrapping launchd.
 
 ## Sandbox Gates
 
@@ -57,6 +58,8 @@ make check
 - Transfer prompt prioritizes user intent but preserves assistant context when
   budget allows.
 - Migration launches interactive Codex, not `codex exec`.
+- Migration probes the installed Codex CLI for interactive initial-prompt
+  support before relaunch.
 - Send-keys based rescue validates the target terminal surface before acting.
 - Cursor/non-cmux terminals degrade to explicit reporting rather than unsafe
   relaunch attempts.

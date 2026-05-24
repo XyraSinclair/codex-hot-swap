@@ -171,6 +171,7 @@ make check
 - [Architecture](docs/architecture.md)
 - [Safety model](docs/safety.md)
 - [Release gates](docs/release-gates.md)
+- [Codex compatibility](docs/codex-compatibility.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Roadmap](docs/roadmap.md)
 - [Contributing](CONTRIBUTING.md)

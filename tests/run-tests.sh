@@ -301,6 +301,7 @@ grep -q "automatically migrated" "$migrate_log"
 
 HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --dry-run >"$sandbox/dry-run.out"
 test ! -e "$sandbox/home/bin/codex-safe"
+test ! -e "$sandbox/home/Library/LaunchAgents"
 
 HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh >"$sandbox/install.out"
 test -x "$sandbox/home/bin/codex-safe"
@@ -310,5 +311,19 @@ test -x "$sandbox/home/bin/codex-status"
 test -x "$sandbox/home/bin/codex-validate"
 test -f "$sandbox/home/codex/codex-hotswap.json"
 test ! -e "$sandbox/home/.zshrc"
+test ! -e "$sandbox/home/Library/LaunchAgents"
+
+plist="$sandbox/rendered.plist"
+HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" CODEX_HOTSWAP_LAUNCHD_LABEL="dev.codex-hot-swap.test" ./install.sh --render-launchd-plist "$plist" >"$sandbox/render-plist.out"
+test -f "$plist"
+grep -q "<string>dev.codex-hot-swap.test</string>" "$plist"
+grep -q "<string>$sandbox/home/bin/codex-predictive-daemon</string>" "$plist"
+grep -q "<string>$sandbox/home/codex</string>" "$plist"
+grep -q "$sandbox/home/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin" "$plist"
+
+dry_plist="$sandbox/dry-rendered.plist"
+HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --dry-run --render-launchd-plist "$dry_plist" >"$sandbox/dry-render-plist.out"
+test ! -e "$dry_plist"
+grep -q "dry-run: would render launchd plist" "$sandbox/dry-render-plist.out"
 
 echo "all tests passed"

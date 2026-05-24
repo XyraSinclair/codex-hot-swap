@@ -14,6 +14,7 @@ os.sys.path.insert(0, str(REPO / "bin"))
 
 from codex_hot_swap_lib import (  # noqa: E402
     account_states,
+    codex_interactive_prompt_supported,
     latest_rollout_from_sqlite,
     load_config,
     mark_broken,
@@ -181,6 +182,15 @@ class HotSwapLibTests(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(latest_rollout_from_sqlite(self.home), new_rollout)
+
+    def test_codex_interactive_prompt_probe(self) -> None:
+        fake_path = REPO / "tests" / "fakes"
+        env = dict(os.environ)
+        env["PATH"] = f"{fake_path}{os.pathsep}{env['PATH']}"
+        env["FAKE_CODEX_HELP_MODE"] = "modern"
+        self.assertTrue(codex_interactive_prompt_supported(env))
+        env["FAKE_CODEX_HELP_MODE"] = "no-prompt"
+        self.assertFalse(codex_interactive_prompt_supported(env))
 
 
 if __name__ == "__main__":

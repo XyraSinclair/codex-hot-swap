@@ -582,6 +582,30 @@ def run_usage_refresh_if_enabled(home: Path, config: dict[str, Any]) -> bool:
         return False
 
 
+def codex_interactive_prompt_supported(env: dict[str, str] | None = None) -> bool:
+    """Return whether installed Codex supports `codex [OPTIONS] [PROMPT]`.
+
+    Migration must relaunch interactive Codex with an initial transfer prompt.
+    `codex exec` is intentionally non-interactive and is not a substitute.
+    """
+
+    try:
+        result = subprocess.run(
+            ["codex", "--help"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            timeout=15,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    text = f"{result.stdout}\n{result.stderr}"
+    return "codex [OPTIONS] [PROMPT]" in text or "Usage: codex [PROMPT]" in text
+
+
 def write_quota_wall_cache(home: Path, states: list[AccountState]) -> dict[str, Any]:
     clock = now()
     accounts: dict[str, Any] = {}

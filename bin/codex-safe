@@ -22,6 +22,7 @@ from codex_hot_swap_lib import (  # noqa: E402
     build_transfer_prompt,
     cleanup_tab_home,
     codex_home,
+    codex_interactive_prompt_supported,
     create_tab_home,
     latest_rollout_from_sqlite,
     load_config,
@@ -123,6 +124,7 @@ def run_interactive(argv: list[str], excluded: set[str] | None = None) -> int:
     excluded = {item.lower() for item in (excluded or set())}
     migrations = 0
     prompt_override: str | None = None
+    interactive_prompt_support: bool | None = None
 
     while True:
         states = account_states(home, config)
@@ -135,6 +137,15 @@ def run_interactive(argv: list[str], excluded: set[str] | None = None) -> int:
         tab_id, tab_home = create_tab_home(home, account)
         child_argv = list(argv)
         if prompt_override:
+            if interactive_prompt_support is None:
+                interactive_prompt_support = codex_interactive_prompt_supported(dict(os.environ))
+            if not interactive_prompt_support:
+                print_banner(
+                    "installed Codex CLI does not advertise interactive initial-prompt support; "
+                    "cannot safely migrate without using codex exec"
+                )
+                cleanup_tab_home(tab_home)
+                return 78
             child_argv.append(prompt_override)
 
         env = dict(os.environ)

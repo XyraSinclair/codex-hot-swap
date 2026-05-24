@@ -31,6 +31,7 @@
 - Done: add uninstall instructions.
 - Remaining: test `--with-daemon` by rendering plist without bootstrapping
   launchd in CI.
+- Done: render launchd plist to an arbitrary path without bootstrapping launchd.
 
 ## Phase 3: Verify Smooth Mode
 
@@ -41,6 +42,8 @@
 - Done: prove all-accounts-walled exits cleanly.
 - Done: prove live migration relaunches with reconstructed prompt under a
   long-running fake Codex process.
+- Done: prove Codex CLI interactive prompt probing accepts supported help text
+  and rejects unsupported help text.
 
 ## Phase 4: Publish
 
