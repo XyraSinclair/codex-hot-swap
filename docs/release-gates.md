@@ -6,12 +6,19 @@ This checklist defines what "shippable" means for Codex Hot Swap.
 
 - `./install.sh --dry-run` prints intended actions and changes nothing.
 - `./install.sh` copies scripts/config only.
+- If run from inside a wrapped Codex tab, install targets the global Codex home,
+  not the per-tab `CODEX_HOME`.
+- `./install.sh` refuses to overwrite unmanaged same-name files.
+- `./install.sh` writes an ownership manifest for later removal.
+- `./install.sh --uninstall` removes only owned files.
+- `./install.sh --uninstall` preserves accounts, credentials, tabs, rollouts,
+  and config unless `--purge-config` is passed.
 - Default install does not start launchd.
 - Default install does not edit shell rc files.
 - Optional daemon install is gated behind `--with-daemon`.
 - Optional alias install is gated behind `--with-alias`.
 - Re-running install is idempotent and does not overwrite user config.
-- Uninstall instructions are printed after install.
+- Uninstall command is printed after install.
 - Launchd plist rendering can be tested without bootstrapping launchd.
 
 ## Sandbox Gates

@@ -59,6 +59,14 @@ make check
 ./install.sh
 ```
 
+If you already have local scripts named `codex-safe`, `codex-status`, or similar
+in the target prefix, the installer refuses to overwrite them unless they are
+known to be from this installer. Use a side-by-side prefix while evaluating:
+
+```bash
+./install.sh --prefix "$HOME/.local/codex-hot-swap/bin"
+```
+
 Use without changing your shell aliases:
 
 ```bash
@@ -87,6 +95,16 @@ codex-smooth-mode --enable
 
 If live tabs are already running, smooth mode refuses unless you pass
 `--allow-live`.
+
+Uninstall:
+
+```bash
+./install.sh --uninstall
+```
+
+Uninstall removes only files the installer can prove it owns. It keeps accounts,
+credentials, tab homes, rollout logs, and `codex-hotswap.json` by default.
+Pass `--purge-config` only if you also want to remove this tool's config file.
 
 ## What This Solves
 
@@ -155,6 +173,7 @@ The final installer must be safe by default:
 ```bash
 ./install.sh --dry-run
 ./install.sh
+./install.sh --uninstall
 ```
 
 Optional behavior must be opt-in:

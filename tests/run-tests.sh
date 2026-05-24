@@ -594,29 +594,47 @@ grep -q '"email": "a@example.com"' "$first_migrate_home/tab.json"
 grep -q '"email": "b@example.com"' "$second_migrate_home/tab.json"
 grep -q "automatically migrated" "$migrate_log"
 
-HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --dry-run >"$sandbox/dry-run.out"
+HOME="$sandbox/home" CODEX_GLOBAL_HOME= CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --dry-run >"$sandbox/dry-run.out"
 test ! -e "$sandbox/home/bin/codex-safe"
 test ! -e "$sandbox/home/Library/LaunchAgents"
 
-HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh >"$sandbox/install.out"
+tab_global_home="$sandbox/tab-global/codex"
+mkdir -p "$tab_global_home/tabs/tab-1"
+HOME="$sandbox/tab-global/home" CODEX_GLOBAL_HOME= CODEX_HOME="$tab_global_home/tabs/tab-1" PREFIX="$sandbox/tab-global/bin" ./install.sh --dry-run >"$sandbox/tab-home-dry-run.out"
+grep -q "CODEX_HOME: $tab_global_home" "$sandbox/tab-home-dry-run.out"
+test ! -e "$tab_global_home/codex-hotswap.json"
+
+collision_home="$sandbox/collision-home"
+mkdir -p "$collision_home/bin" "$collision_home/codex"
+printf 'legacy-wrapper\n' >"$collision_home/bin/codex-safe"
+if HOME="$collision_home" CODEX_GLOBAL_HOME= CODEX_HOME="$collision_home/codex" PREFIX="$collision_home/bin" ./install.sh >"$sandbox/collision.out" 2>"$sandbox/collision.err"; then
+  echo "installer unexpectedly overwrote an unmanaged codex-safe" >&2
+  exit 1
+fi
+grep -q "not owned by this installer" "$sandbox/collision.err"
+grep -q "legacy-wrapper" "$collision_home/bin/codex-safe"
+
+HOME="$sandbox/home" CODEX_GLOBAL_HOME= CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh >"$sandbox/install.out"
 test -x "$sandbox/home/bin/codex-safe"
 test -x "$sandbox/home/bin/codex-continue"
 test -x "$sandbox/home/bin/codex-rescue"
 test -x "$sandbox/home/bin/codex-status"
 test -x "$sandbox/home/bin/codex-validate"
 test -f "$sandbox/home/codex/codex-hotswap.json"
+test -f "$sandbox/home/codex/codex-hotswap-install-manifest.json"
+grep -q "codex-safe" "$sandbox/home/codex/codex-hotswap-install-manifest.json"
 test ! -e "$sandbox/home/.zshrc"
 test ! -e "$sandbox/home/Library/LaunchAgents"
 printf '{"custom": true}\n' >"$sandbox/home/codex/codex-hotswap.json"
-HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh >"$sandbox/install-again.out"
+HOME="$sandbox/home" CODEX_GLOBAL_HOME= CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh >"$sandbox/install-again.out"
 grep -q '"custom": true' "$sandbox/home/codex/codex-hotswap.json"
-HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --with-alias >"$sandbox/install-alias.out"
+HOME="$sandbox/home" CODEX_GLOBAL_HOME= CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --with-alias >"$sandbox/install-alias.out"
 grep -q "alias codex='codex-safe'" "$sandbox/home/.zshrc"
-HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --with-alias >"$sandbox/install-alias-again.out"
+HOME="$sandbox/home" CODEX_GLOBAL_HOME= CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --with-alias >"$sandbox/install-alias-again.out"
 test "$(grep -c "alias codex='codex-safe'" "$sandbox/home/.zshrc")" -eq 1
 
 plist="$sandbox/rendered.plist"
-HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" CODEX_HOTSWAP_LAUNCHD_LABEL="dev.codex-hot-swap.test" ./install.sh --render-launchd-plist "$plist" >"$sandbox/render-plist.out"
+HOME="$sandbox/home" CODEX_GLOBAL_HOME= CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" CODEX_HOTSWAP_LAUNCHD_LABEL="dev.codex-hot-swap.test" ./install.sh --render-launchd-plist "$plist" >"$sandbox/render-plist.out"
 test -f "$plist"
 grep -q "<string>dev.codex-hot-swap.test</string>" "$plist"
 grep -q "<string>$sandbox/home/bin/codex-predictive-daemon</string>" "$plist"
@@ -624,8 +642,34 @@ grep -q "<string>$sandbox/home/codex</string>" "$plist"
 grep -q "$sandbox/home/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin" "$plist"
 
 dry_plist="$sandbox/dry-rendered.plist"
-HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --dry-run --render-launchd-plist "$dry_plist" >"$sandbox/dry-render-plist.out"
+HOME="$sandbox/home" CODEX_GLOBAL_HOME= CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --dry-run --render-launchd-plist "$dry_plist" >"$sandbox/dry-render-plist.out"
 test ! -e "$dry_plist"
 grep -q "dry-run: would render launchd plist" "$sandbox/dry-render-plist.out"
+
+HOME="$sandbox/home" CODEX_GLOBAL_HOME= CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --uninstall --dry-run >"$sandbox/uninstall-dry-run.out"
+test -x "$sandbox/home/bin/codex-safe"
+grep -q "dry-run: rm -f" "$sandbox/uninstall-dry-run.out"
+
+HOME="$sandbox/home" CODEX_GLOBAL_HOME= CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --uninstall >"$sandbox/uninstall.out"
+test ! -e "$sandbox/home/bin/codex-safe"
+test ! -e "$sandbox/home/bin/codex-continue"
+test ! -e "$sandbox/home/bin/codex-rescue"
+test ! -e "$sandbox/home/bin/codex-smooth-mode"
+test -f "$sandbox/home/codex/codex-hotswap.json"
+test ! -e "$sandbox/home/codex/codex-hotswap-install-manifest.json"
+if grep -q "alias codex='codex-safe'" "$sandbox/home/.zshrc"; then
+  echo "uninstaller left the public alias block behind" >&2
+  exit 1
+fi
+
+HOME="$sandbox/home" CODEX_GLOBAL_HOME= CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --uninstall --purge-config >"$sandbox/uninstall-purge.out"
+test ! -e "$sandbox/home/codex/codex-hotswap.json"
+
+legacy_home="$sandbox/legacy-home"
+mkdir -p "$legacy_home/bin" "$legacy_home/codex"
+printf 'legacy-wrapper\n' >"$legacy_home/bin/codex-safe"
+HOME="$legacy_home" CODEX_GLOBAL_HOME= CODEX_HOME="$legacy_home/codex" PREFIX="$legacy_home/bin" ./install.sh --uninstall >"$sandbox/legacy-uninstall.out" 2>"$sandbox/legacy-uninstall.err"
+grep -q "leaving unmanaged or modified file" "$sandbox/legacy-uninstall.err"
+grep -q "legacy-wrapper" "$legacy_home/bin/codex-safe"
 
 echo "all tests passed"

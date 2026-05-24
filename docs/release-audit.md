@@ -18,6 +18,11 @@ Codex/fake codex-auth/fake cmux integration tests, installer tests, and
 | --- | --- | --- |
 | `./install.sh --dry-run` changes nothing | `tests/run-tests.sh` verifies no installed `codex-safe` after dry-run | Proven |
 | Default install copies scripts/config only | `tests/run-tests.sh` checks installed scripts/config and no `.zshrc` or LaunchAgents | Proven |
+| Installer does not treat a wrapped tab home as the global Codex home | `tests/run-tests.sh` sets `CODEX_HOME` to `.../tabs/<id>` and verifies install defaults to its parent global home | Proven |
+| Installer refuses to overwrite unmanaged files | `tests/run-tests.sh` plants a legacy `codex-safe` and verifies install aborts without modifying it | Proven |
+| Install writes an ownership manifest | `tests/run-tests.sh` checks `codex-hotswap-install-manifest.json` after install | Proven |
+| Uninstall removes only owned files | `tests/run-tests.sh` uninstalls a manifest-backed install and separately verifies an unmanaged legacy file is left in place | Proven |
+| Uninstall preserves config by default | `tests/run-tests.sh` verifies `codex-hotswap.json` survives uninstall and is removed only with `--purge-config` | Proven |
 | Daemon install is opt-in | Default install test verifies no LaunchAgents; plist render is separate from bootstrap | Proven |
 | Alias install is opt-in and idempotent | `tests/run-tests.sh` runs `--with-alias` twice and checks one alias | Proven |
 | Existing config is not overwritten | `tests/run-tests.sh` writes custom config then re-runs installer | Proven |
