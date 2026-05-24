@@ -7,7 +7,15 @@ trap 'rm -rf "$sandbox"' EXIT
 
 cd "$repo"
 
-python3 -m py_compile bin/codex_hot_swap_lib.py bin/codex-status bin/codex-predictive-daemon bin/codex-safe bin/codex-smooth-mode
+python3 -m py_compile \
+  bin/codex_hot_swap_lib.py \
+  bin/codex-status \
+  bin/codex-predictive-daemon \
+  bin/codex-safe \
+  bin/codex-continue \
+  bin/codex-rescue \
+  bin/codex-smooth-mode \
+  bin/codex-validate
 bash -n install.sh
 python3 tests/test_lib.py
 
@@ -83,18 +91,223 @@ PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" CODEX_HOTSWAP_KEEP_TAB
 wrapped_home="$(awk -F= '/^home=/{print $2; exit}' "$fake_log")"
 grep -q '"email": "b@example.com"' "$wrapped_home/tab.json"
 
+cat >"$wrapper_home/predictive_quota_walls.json" <<JSON
+{
+  "written_at": $(python3 - <<'PY'
+import time
+print(time.time())
+PY
+),
+  "accounts": {
+    "a@example.com": {
+      "email": "a@example.com",
+      "windows": {
+        "weekly": {
+          "remaining_percent": 0,
+          "resets_at": $(python3 - <<'PY'
+import time
+print(time.time() + 3600)
+PY
+)
+        }
+      }
+    },
+    "b@example.com": {
+      "email": "b@example.com",
+      "windows": {
+        "weekly": {
+          "remaining_percent": 0,
+          "resets_at": $(python3 - <<'PY'
+import time
+print(time.time() + 3600)
+PY
+)
+        }
+      }
+    }
+  }
+}
+JSON
+: >"$fake_log"
+if PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" FAKE_CODEX_LOG="$fake_log" ./bin/codex-safe "hello" >"$sandbox/all-walled.out"; then
+  echo "codex-safe unexpectedly succeeded when all accounts were walled" >&2
+  exit 1
+fi
+grep -q "no usable account" "$sandbox/all-walled.out"
+test ! -s "$fake_log"
+
 rm -f "$wrapper_home/predictive_quota_walls.json"
 rm -f "$wrapper_home/accounts/recover/broken.tsv"
 : >"$fake_log"
 PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" CODEX_HOTSWAP_KEEP_TABS=1 FAKE_CODEX_LOG="$fake_log" FAKE_CODEX_OUTPUT="You've hit your usage limit" ./bin/codex-safe "hello" >/dev/null
 test ! -e "$wrapper_home/accounts/recover/broken.tsv"
 
+rollout_dir="$wrapper_home/sessions/2026/05/24"
+mkdir -p "$rollout_dir"
+rollout="$rollout_dir/rollout-test.jsonl"
+cat >"$rollout" <<'JSONL'
+{"item":{"role":"user","content":[{"type":"text","text":"Please continue the work."}]}}
+{"item":{"role":"assistant","content":[{"type":"text","text":"I will inspect the repo next."}]}}
+JSONL
+prompt_out="$sandbox/transfer-prompt.out"
+CODEX_HOME="$wrapper_home" ./bin/codex-continue "$rollout" --print >"$prompt_out"
+grep -q "automatically migrated" "$prompt_out"
+grep -q "Please continue the work" "$prompt_out"
+
+: >"$fake_log"
+PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" FAKE_CODEX_LOG="$fake_log" ./bin/codex-validate --to a@example.com >/dev/null
+grep -q "argv=exec --skip-git-repo-check" "$fake_log"
+validate_home="$(awk -F= '/^home=/{print $2; exit}' "$fake_log")"
+case "$validate_home" in
+  "$wrapper_home"/tmp/validate-*) ;;
+  *) echo "expected validate temp CODEX_HOME, got $validate_home" >&2; exit 1 ;;
+esac
+test ! -e "$validate_home"
+
+CODEX_HOME="$wrapper_home" ./bin/codex-rescue >/dev/null
+
+live_tab="$wrapper_home/tabs/live-test"
+mkdir -p "$live_tab"
+cat >"$live_tab/tab.json" <<JSON
+{
+  "tab_id": "live-test",
+  "email": "a@example.com",
+  "wrapper_pid": $$,
+  "child_pid": 0,
+  "status": "running"
+}
+JSON
+if CODEX_HOME="$wrapper_home" ./bin/codex-smooth-mode --enable >"$sandbox/smooth.out" 2>"$sandbox/smooth.err"; then
+  echo "smooth mode unexpectedly enabled with live tabs" >&2
+  exit 1
+fi
+grep -q "Refusing to enable smooth mode" "$sandbox/smooth.err"
+
+cat >"$wrapper_home/codex-hotswap.json" <<'JSON'
+{
+  "switch_default": true,
+  "refresh_codex_auth_usage": false
+}
+JSON
+cat >"$wrapper_home/predictive_quota_walls.json" <<JSON
+{
+  "written_at": $(python3 - <<'PY'
+import time
+print(time.time())
+PY
+),
+  "accounts": {
+    "a@example.com": {
+      "email": "a@example.com",
+      "windows": {
+        "weekly": {
+          "remaining_percent": 0,
+          "resets_at": $(python3 - <<'PY'
+import time
+print(time.time() + 3600)
+PY
+)
+        }
+      }
+    }
+  }
+}
+JSON
+if CODEX_HOME="$wrapper_home" ./bin/codex-rescue >"$sandbox/rescue.out"; then
+  echo "rescue unexpectedly returned success for stuck tab report" >&2
+  exit 1
+fi
+grep -q "live-test" "$sandbox/rescue.out"
+
+auth_log="$sandbox/codex-auth.log"
+PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" FAKE_CODEX_AUTH_LOG="$auth_log" FAKE_CODEX_AUTH_FAIL_IF_CALLED=1 ./bin/codex-predictive-daemon --once
+test ! -e "$auth_log"
+
+migrate_home="$sandbox/migrate-home"
+mkdir -p "$migrate_home/accounts" "$migrate_home/sessions"
+cat >"$migrate_home/accounts/registry.json" <<'JSON'
+{
+  "accounts": {
+    "a": {
+      "email": "a@example.com",
+      "auth_path": "a.auth.json",
+      "usage": {
+        "5h": {"used_percent": 10},
+        "weekly": {"used_percent": 10}
+      }
+    },
+    "b": {
+      "email": "b@example.com",
+      "auth_path": "b.auth.json",
+      "usage": {
+        "5h": {"used_percent": 20},
+        "weekly": {"used_percent": 20}
+      }
+    }
+  }
+}
+JSON
+printf '{}\n' >"$migrate_home/accounts/a.auth.json"
+printf '{}\n' >"$migrate_home/accounts/b.auth.json"
+cat >"$migrate_home/codex-hotswap.json" <<'JSON'
+{
+  "quota_wall_max_age_seconds": 300,
+  "live_migrate_idle_seconds": 1,
+  "max_live_migrations_per_tab": 2
+}
+JSON
+migrate_log="$sandbox/migrate-fake-codex.log"
+PATH="$repo/tests/fakes:$PATH" \
+  CODEX_HOME="$migrate_home" \
+  CODEX_HOTSWAP_KEEP_TABS=1 \
+  FAKE_CODEX_LOG="$migrate_log" \
+  FAKE_CODEX_SLEEP=6 \
+  FAKE_CODEX_MIGRATED_SLEEP=0 \
+  FAKE_CODEX_WRITE_ROLLOUT=1 \
+  ./bin/codex-safe "hello" >"$sandbox/migrate.out" &
+migrate_pid=$!
+sleep 3
+cat >"$migrate_home/predictive_quota_walls.json" <<JSON
+{
+  "written_at": $(python3 - <<'PY'
+import time
+print(time.time())
+PY
+),
+  "accounts": {
+    "a@example.com": {
+      "email": "a@example.com",
+      "windows": {
+        "weekly": {
+          "remaining_percent": 0,
+          "resets_at": $(python3 - <<'PY'
+import time
+print(time.time() + 3600)
+PY
+)
+        }
+      }
+    }
+  }
+}
+JSON
+wait "$migrate_pid"
+test "$(grep -c '^home=' "$migrate_log")" -eq 2
+first_migrate_home="$(awk -F= '/^home=/{print $2; exit}' "$migrate_log")"
+second_migrate_home="$(awk -F= '/^home=/{count++; if (count == 2) {print $2; exit}}' "$migrate_log")"
+grep -q '"email": "a@example.com"' "$first_migrate_home/tab.json"
+grep -q '"email": "b@example.com"' "$second_migrate_home/tab.json"
+grep -q "automatically migrated" "$migrate_log"
+
 HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --dry-run >"$sandbox/dry-run.out"
 test ! -e "$sandbox/home/bin/codex-safe"
 
 HOME="$sandbox/home" CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh >"$sandbox/install.out"
 test -x "$sandbox/home/bin/codex-safe"
+test -x "$sandbox/home/bin/codex-continue"
+test -x "$sandbox/home/bin/codex-rescue"
 test -x "$sandbox/home/bin/codex-status"
+test -x "$sandbox/home/bin/codex-validate"
 test -f "$sandbox/home/codex/codex-hotswap.json"
 test ! -e "$sandbox/home/.zshrc"
 

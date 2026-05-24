@@ -109,9 +109,12 @@ run mkdir -p "$codex_home"
 
 for script in \
   codex-safe \
+  codex-continue \
   codex-status \
   codex-predictive-daemon \
+  codex-rescue \
   codex-smooth-mode \
+  codex-validate \
   codex_hot_swap_lib.py
 do
   run install -m 0755 "$script_dir/bin/$script" "$prefix/$script"

@@ -5,12 +5,43 @@ log="${FAKE_CODEX_LOG:?FAKE_CODEX_LOG required}"
 printf 'argv=%s\n' "$*" >> "$log"
 printf 'home=%s\n' "${CODEX_HOME:-}" >> "$log"
 
+if [ "${FAKE_CODEX_WRITE_ROLLOUT:-0}" = "1" ]; then
+  python3 - <<'PY'
+import json
+import os
+import sqlite3
+import time
+from pathlib import Path
+
+home = Path(os.environ["CODEX_HOME"])
+sessions = home / "sessions" / "2026" / "05" / "24"
+sessions.mkdir(parents=True, exist_ok=True)
+rollout = sessions / f"rollout-{os.getpid()}.jsonl"
+with rollout.open("w", encoding="utf-8") as handle:
+    handle.write(json.dumps({"item": {"role": "user", "content": [{"text": "Keep going after migration."}]}}) + "\n")
+    handle.write(json.dumps({"item": {"role": "assistant", "content": [{"text": "I was mid-task before migration."}]}}) + "\n")
+db = home / "state_5.sqlite"
+conn = sqlite3.connect(db)
+try:
+    conn.execute("create table if not exists threads (rollout_path text, updated_at integer)")
+    conn.execute("insert into threads (rollout_path, updated_at) values (?, ?)", (str(rollout), int(time.time())))
+    conn.commit()
+finally:
+    conn.close()
+PY
+fi
+
 if [ "${FAKE_CODEX_OUTPUT:-}" != "" ]; then
   printf '%s\n' "$FAKE_CODEX_OUTPUT"
 fi
 
-if [ "${FAKE_CODEX_SLEEP:-0}" != "0" ]; then
-  sleep "$FAKE_CODEX_SLEEP"
+sleep_for="${FAKE_CODEX_SLEEP:-0}"
+if [[ "$*" == *"automatically migrated"* ]]; then
+  sleep_for="${FAKE_CODEX_MIGRATED_SLEEP:-$sleep_for}"
+fi
+
+if [ "$sleep_for" != "0" ]; then
+  sleep "$sleep_for"
 fi
 
 exit "${FAKE_CODEX_EXIT:-0}"

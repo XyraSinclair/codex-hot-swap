@@ -16,7 +16,6 @@ import fcntl
 import json
 import os
 import shutil
-import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -552,6 +551,17 @@ def pick_account(
     return sorted(candidates, key=score, reverse=True)[0]
 
 
+def find_account(states: list[AccountState], selector: str) -> AccountState | None:
+    selector_lower = selector.lower()
+    for state in states:
+        if state.email.lower() == selector_lower or state.key.lower() == selector_lower:
+            return state
+    for state in states:
+        if selector_lower in state.email.lower():
+            return state
+    return None
+
+
 def run_usage_refresh_if_enabled(home: Path, config: dict[str, Any]) -> bool:
     if not config.get("refresh_codex_auth_usage", False):
         return False
@@ -715,6 +725,20 @@ def latest_rollout_from_sqlite(tab_home: Path) -> Path | None:
     if not path.is_absolute():
         path = tab_home / path
     return path if path.exists() else None
+
+
+def latest_rollout_under(home: Path) -> Path | None:
+    sessions = home / "sessions"
+    if not sessions.exists():
+        return None
+    candidates = [
+        path
+        for path in sessions.rglob("*.jsonl")
+        if path.is_file() and path.name.startswith("rollout-")
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 def _extract_text(value: Any) -> str:

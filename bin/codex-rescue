@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+from codex_hot_swap_lib import codex_home, live_tabs, load_config, quota_walled_emails  # noqa: E402
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Inspect or clear tabs pinned to fresh quota walls")
+    parser.add_argument("--apply", action="store_true", help="terminate affected child processes")
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="required with --apply to confirm terminating affected children",
+    )
+    args = parser.parse_args()
+
+    home = codex_home()
+    config = load_config(home)
+    walled = quota_walled_emails(home, config)
+    tabs = live_tabs(home)
+    stuck = [tab for tab in tabs if str(tab.get("email", "")).lower() in walled]
+
+    if not stuck:
+        print("No live tabs are pinned to a fresh quota wall.")
+        return 0
+
+    print("Tabs pinned to fresh quota walls:")
+    for tab in stuck:
+        print(
+            f"- tab={tab.get('tab_id', '?')} "
+            f"email={tab.get('email', '?')} "
+            f"child={tab.get('child_pid', '-')}"
+        )
+
+    if not args.apply:
+        print("Run codex-rescue --apply --yes to terminate affected child processes.")
+        return 1
+    if not args.yes:
+        print("--apply requires --yes", file=sys.stderr)
+        return 2
+
+    failures = 0
+    for tab in stuck:
+        child_pid = int(tab.get("child_pid") or 0)
+        if child_pid <= 0:
+            failures += 1
+            continue
+        try:
+            os.kill(child_pid, signal.SIGTERM)
+            print(f"terminated child {child_pid} for {tab.get('email', '?')}")
+        except ProcessLookupError:
+            print(f"child already exited: {child_pid}")
+        except PermissionError:
+            failures += 1
+            print(f"permission denied terminating child {child_pid}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

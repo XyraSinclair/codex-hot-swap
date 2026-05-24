@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+from codex_hot_swap_lib import (  # noqa: E402
+    build_transfer_prompt,
+    codex_home,
+    latest_rollout_from_sqlite,
+    latest_rollout_under,
+)
+
+
+def resolve_rollout(args: argparse.Namespace) -> Path | None:
+    if args.rollout:
+        path = Path(args.rollout).expanduser()
+        return path if path.exists() else None
+    if args.tab_home:
+        rollout = latest_rollout_from_sqlite(Path(args.tab_home).expanduser())
+        if rollout is not None:
+            return rollout
+    home = codex_home()
+    rollout = latest_rollout_from_sqlite(home)
+    if rollout is not None:
+        return rollout
+    return latest_rollout_under(home)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Build or launch a Codex context-transfer prompt from rollout JSONL"
+    )
+    parser.add_argument("rollout", nargs="?", help="rollout JSONL path")
+    parser.add_argument("--tab-home", help="tab CODEX_HOME to inspect for state_5.sqlite")
+    parser.add_argument("--max-chars", type=int, default=30000)
+    parser.add_argument("--print", dest="print_prompt", action="store_true")
+    parser.add_argument("--launch", action="store_true", help="launch interactive codex-safe")
+    parser.add_argument(
+        "--switch",
+        action="store_true",
+        help="accepted for compatibility; account choice is handled by codex-safe",
+    )
+    args = parser.parse_args()
+
+    rollout = resolve_rollout(args)
+    if rollout is None:
+        print("No rollout could be found.", file=sys.stderr)
+        return 2
+
+    prompt = build_transfer_prompt(rollout, max_chars=args.max_chars)
+    if args.print_prompt or not args.launch:
+        print(prompt)
+        if not args.launch:
+            return 0
+
+    os.execvpe("codex-safe", ["codex-safe", prompt], os.environ)
+    raise AssertionError("unreachable")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

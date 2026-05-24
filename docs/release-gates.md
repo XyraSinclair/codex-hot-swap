@@ -21,6 +21,12 @@ This checklist defines what "shippable" means for Codex Hot Swap.
 - Fake `codex` and fake `codex-auth` model the production behaviors relied on
   by the wrapper.
 
+Current local gate:
+
+```bash
+make check
+```
+
 ## Wrapper Gates
 
 - Normal child exit code is preserved.

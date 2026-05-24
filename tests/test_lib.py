@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -13,6 +14,7 @@ os.sys.path.insert(0, str(REPO / "bin"))
 
 from codex_hot_swap_lib import (  # noqa: E402
     account_states,
+    latest_rollout_from_sqlite,
     load_config,
     mark_broken,
     pick_account,
@@ -106,6 +108,30 @@ class HotSwapLibTests(unittest.TestCase):
         )
         self.assertEqual(quota_walled_emails(self.home), set())
 
+    def test_active_weekly_wall_survives_expired_5h_window(self) -> None:
+        write_json_atomic(
+            wall_cache_path(self.home),
+            {
+                "written_at": time.time(),
+                "accounts": {
+                    "a@example.com": {
+                        "email": "a@example.com",
+                        "windows": {
+                            "5h": {
+                                "remaining_percent": 0,
+                                "resets_at": time.time() - 5,
+                            },
+                            "weekly": {
+                                "remaining_percent": 0,
+                                "resets_at": time.time() + 3600,
+                            },
+                        },
+                    }
+                },
+            },
+        )
+        self.assertEqual(quota_walled_emails(self.home), {"a@example.com"})
+
     def test_pick_account_excludes_walled_and_broken_accounts(self) -> None:
         config = load_config(self.home)
         states = account_states(self.home, config)
@@ -131,6 +157,30 @@ class HotSwapLibTests(unittest.TestCase):
             "5h quota at 0%",
         )
         self.assertIsNone(migration_reason_for("a@example.com", self.home, config))
+
+    def test_rollout_lookup_uses_tab_sqlite_latest_thread(self) -> None:
+        old_rollout = self.home / "sessions" / "old" / "rollout-old.jsonl"
+        new_rollout = self.home / "sessions" / "new" / "rollout-new.jsonl"
+        old_rollout.parent.mkdir(parents=True)
+        new_rollout.parent.mkdir(parents=True)
+        old_rollout.write_text("{}\n", encoding="utf-8")
+        new_rollout.write_text("{}\n", encoding="utf-8")
+        db = self.home / "state_5.sqlite"
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute("create table threads (rollout_path text, updated_at integer)")
+            conn.execute(
+                "insert into threads (rollout_path, updated_at) values (?, ?)",
+                (str(old_rollout), 1),
+            )
+            conn.execute(
+                "insert into threads (rollout_path, updated_at) values (?, ?)",
+                (str(new_rollout), 2),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(latest_rollout_from_sqlite(self.home), new_rollout)
 
 
 if __name__ == "__main__":

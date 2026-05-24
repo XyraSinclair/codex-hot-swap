@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+from codex_hot_swap_lib import (  # noqa: E402
+    account_states,
+    codex_home,
+    ensure_tab_home,
+    find_account,
+    load_config,
+)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Validate one Codex account vault in isolation")
+    parser.add_argument("--to", "--account", dest="account", required=True, help="email or account key")
+    parser.add_argument(
+        "--prompt",
+        default="Reply with exactly: codex-hot-swap validation ok",
+        help="validation prompt for codex exec",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("CODEX_VALIDATE_MODEL"),
+        help="optional model override; omitted by default",
+    )
+    parser.add_argument("--keep-home", action="store_true", help="keep temporary CODEX_HOME")
+    args = parser.parse_args()
+
+    home = codex_home()
+    config = load_config(home)
+    account = find_account(account_states(home, config), args.account)
+    if account is None:
+        print(f"account not found: {args.account}", file=sys.stderr)
+        return 2
+    if not account.auth_exists:
+        print(f"account vault missing: {account.email}", file=sys.stderr)
+        return 2
+
+    tmp_root = home / "tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    temp_home = Path(tempfile.mkdtemp(prefix="validate-", dir=str(tmp_root)))
+    try:
+        ensure_tab_home(temp_home, home)
+        shutil.copy2(account.auth_path, temp_home / "auth.json")
+        os.chmod(temp_home / "auth.json", 0o600)
+
+        cmd = ["codex", "exec", "--skip-git-repo-check"]
+        if args.model:
+            cmd.extend(["--model", args.model])
+        cmd.append(args.prompt)
+        env = dict(os.environ)
+        env["CODEX_HOME"] = str(temp_home)
+        result = subprocess.run(cmd, env=env, check=False)
+        if result.returncode == 0:
+            print(f"validated {account.email}")
+        return result.returncode
+    finally:
+        if args.keep_home:
+            print(f"kept temporary CODEX_HOME: {temp_home}", file=sys.stderr)
+        else:
+            shutil.rmtree(temp_home, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

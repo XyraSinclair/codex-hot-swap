@@ -9,9 +9,9 @@ wall. Running sessions get isolated auth snapshots, quota state comes from a
 structured cache, and context migration happens locally from append-only rollout
 logs.
 
-> Status: public repo staging branch. The first clean implementation slice is in
-> place, but this should not be treated as production until the release gates in
-> [docs/release-gates.md](docs/release-gates.md) pass.
+> Status: public staging repo. The core command surface is implemented and
+> covered by sandbox tests, but this should not be treated as production until
+> the full release gates in [docs/release-gates.md](docs/release-gates.md) pass.
 
 ## Goal
 
@@ -84,15 +84,10 @@ codex-safe --help
 codex-status
 codex-predictive-daemon --once
 codex-smooth-mode --enable
-```
-
-Planned before production release:
-
-```bash
 codex-validate --to <email>
 codex-continue --switch --launch
 codex-rescue
-codex-rescue --apply
+codex-rescue --apply --yes
 ```
 
 Shell aliases are optional and explicit:
@@ -163,6 +158,12 @@ This repo is not production-ready until the gates in
 - global auth rewrites are refused while live tabs exist;
 - migration launches interactive Codex, not `codex exec`;
 - installer defaults do not start services or edit shell rc files.
+
+Current sandbox evidence is available with:
+
+```bash
+make check
+```
 
 ## Documentation
 
