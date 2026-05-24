@@ -18,8 +18,8 @@
 - Done: implement cmux-aware `codex-rescue` with stale-surface validation.
 - Done: implement `codex-smooth-mode`.
 - Done: add sandbox fake `codex` and fake `codex-auth` tests.
-- Remaining: recover or replace any proven behavior from the inaccessible old
-  checkout that is not yet represented by current tests.
+- Done: replace private-checkout assumptions with public tests and release-gate
+  evidence.
 
 ## Phase 2: Harden Public Installer
 
@@ -29,8 +29,6 @@
 - Done: add `--dry-run`.
 - Done: add sandbox installer tests.
 - Done: add uninstall instructions.
-- Remaining: test `--with-daemon` by rendering plist without bootstrapping
-  launchd in CI.
 - Done: render launchd plist to an arbitrary path without bootstrapping launchd.
 
 ## Phase 3: Verify Smooth Mode
@@ -63,5 +61,5 @@ holding snapshots of one rotating chain.
 
 - Done: document the broker design, feasible modes, and upstream constraints in
   `docs/refresh-broker.md`.
-- Remaining: implement strict lease mode if the project wants complete
+- Future: implement strict lease mode if the project wants complete
   refresh-token serialization without upstream Codex changes.

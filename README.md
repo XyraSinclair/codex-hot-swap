@@ -126,7 +126,7 @@ from broken accounts.
 
 ## Command Surface
 
-Implemented in this staging repo:
+Implemented in v1:
 
 ```bash
 codex-safe --help
