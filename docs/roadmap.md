@@ -15,7 +15,7 @@
 - Done: implement `codex-status`.
 - Done: implement `codex-continue`.
 - Done: implement `codex-validate`.
-- Done: implement conservative `codex-rescue`.
+- Done: implement cmux-aware `codex-rescue` with stale-surface validation.
 - Done: implement `codex-smooth-mode`.
 - Done: add sandbox fake `codex` and fake `codex-auth` tests.
 - Remaining: recover or replace any proven behavior from the inaccessible old
@@ -44,6 +44,8 @@
   long-running fake Codex process.
 - Done: prove Codex CLI interactive prompt probing accepts supported help text
   and rejects unsupported help text.
+- Done: prove cmux rescue validates terminal surfaces, rejects stale surfaces,
+  and degrades safely for non-cmux tabs.
 
 ## Phase 4: Publish
 

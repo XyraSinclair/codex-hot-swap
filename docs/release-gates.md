@@ -55,6 +55,7 @@ make check
 
 - Rollout lookup uses the tab's own `state_5.sqlite`, not cwd matching.
 - SQLite reads use read-only/immutable access where supported.
+- Wrapped tabs record cmux workspace/pane/surface metadata when present.
 - Transfer prompt prioritizes user intent but preserves assistant context when
   budget allows.
 - Migration launches interactive Codex, not `codex exec`.

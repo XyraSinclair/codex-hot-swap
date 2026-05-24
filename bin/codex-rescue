@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
+import shlex
 import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -12,14 +17,173 @@ sys.path.insert(0, str(HERE))
 
 from codex_hot_swap_lib import codex_home, live_tabs, load_config, quota_walled_emails  # noqa: E402
 
+DEFAULT_PROMPT_RE = r"(?m)(^|\n).{0,120}([#$%>]|\]) ?$"
+
+
+def tab_home_from(tab: dict) -> Path | None:
+    tab_file = tab.get("_tab_file")
+    if not tab_file:
+        return None
+    return Path(str(tab_file)).parent
+
+
+def cmux_meta(tab: dict) -> dict[str, str]:
+    meta = tab.get("cmux")
+    if not isinstance(meta, dict):
+        meta = {}
+    result = {
+        "workspace_id": meta.get("workspace_id") or tab.get("cmux_workspace_id"),
+        "panel_id": meta.get("panel_id") or tab.get("cmux_panel_id"),
+        "tab_id": meta.get("tab_id") or tab.get("cmux_tab_id"),
+        "surface_id": meta.get("surface_id") or meta.get("tab_id") or tab.get("cmux_surface_id"),
+    }
+    return {key: str(value) for key, value in result.items() if value}
+
+
+def run_cmux(args: list[str]) -> subprocess.CompletedProcess[str]:
+    cmux = os.environ.get("CODEX_HOTSWAP_CMUX", "cmux")
+    return subprocess.run(
+        [cmux, *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+
+def parse_surfaces(text: str) -> list[dict]:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        for key in ("surfaces", "items", "data"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return [data]
+    return []
+
+
+def surface_values(surface: dict) -> set[str]:
+    values: set[str] = set()
+    for key in ("id", "uuid", "surface_id", "tab_id", "ref", "short_ref", "handle"):
+        value = surface.get(key)
+        if value is not None:
+            values.add(str(value))
+    return values
+
+
+def surface_kind(surface: dict) -> str:
+    for key in ("type", "kind", "surface_type"):
+        value = surface.get(key)
+        if value is not None:
+            return str(value).lower()
+    return "terminal"
+
+
+def surface_handle(surface: dict, fallback: str | None = None) -> str | None:
+    for key in ("id", "uuid", "surface_id", "ref", "short_ref"):
+        value = surface.get(key)
+        if value:
+            return str(value)
+    return fallback
+
+
+def validate_cmux_surface(tab: dict) -> tuple[bool, str, dict[str, str]]:
+    meta = cmux_meta(tab)
+    workspace = meta.get("workspace_id")
+    pane = meta.get("panel_id")
+    target_surface = meta.get("surface_id") or meta.get("tab_id")
+    if not workspace or not (pane or target_surface):
+        return False, "no cmux metadata", meta
+
+    args = ["--json", "list-pane-surfaces"]
+    if workspace:
+        args.extend(["--workspace", workspace])
+    if pane:
+        args.extend(["--pane", pane])
+    try:
+        result = run_cmux(args)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return False, f"cmux unavailable: {exc}", meta
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        return False, f"cmux list-pane-surfaces failed: {detail}", meta
+
+    surfaces = parse_surfaces(result.stdout)
+    if not surfaces:
+        return False, "cmux surface is stale or missing", meta
+
+    selected = None
+    if target_surface:
+        for surface in surfaces:
+            if target_surface in surface_values(surface):
+                selected = surface
+                break
+    else:
+        terminals = [surface for surface in surfaces if surface_kind(surface) == "terminal"]
+        if len(terminals) == 1:
+            selected = terminals[0]
+    if selected is None:
+        return False, "captured surface is not present in cmux pane", meta
+    if surface_kind(selected) != "terminal":
+        return False, "captured cmux surface is not a terminal", meta
+
+    handle = surface_handle(selected, target_surface)
+    if not handle:
+        return False, "cmux terminal surface has no usable handle", meta
+    meta["surface_id"] = handle
+    return True, "cmux terminal surface validated", meta
+
+
+def shell_ready(workspace: str, surface: str, prompt_regex: str, timeout: float) -> tuple[bool, str]:
+    pattern = re.compile(prompt_regex)
+    deadline = time.time() + timeout
+    last_screen = ""
+    while time.time() <= deadline:
+        result = run_cmux(
+            ["read-screen", "--workspace", workspace, "--surface", surface, "--lines", "8"]
+        )
+        last_screen = result.stdout
+        if result.returncode == 0 and pattern.search(result.stdout):
+            return True, result.stdout
+        time.sleep(0.25)
+    return False, last_screen
+
+
+def send_recovery(home: Path, tab_home: Path, workspace: str, surface: str) -> tuple[bool, str]:
+    command = (
+        f"CODEX_HOME={shlex.quote(str(home))} "
+        f"codex-continue --tab-home {shlex.quote(str(tab_home))} --launch"
+    )
+    send = run_cmux(["send", "--workspace", workspace, "--surface", surface, command])
+    if send.returncode != 0:
+        return False, (send.stderr or send.stdout).strip()
+    enter = run_cmux(["send-key", "--workspace", workspace, "--surface", surface, "Enter"])
+    if enter.returncode != 0:
+        return False, (enter.stderr or enter.stdout).strip()
+    return True, command
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Inspect or clear tabs pinned to fresh quota walls")
-    parser.add_argument("--apply", action="store_true", help="terminate affected child processes")
+    parser.add_argument("--apply", action="store_true", help="relaunch affected cmux tabs when safe")
     parser.add_argument(
         "--yes",
         action="store_true",
-        help="required with --apply to confirm terminating affected children",
+        help="required with --apply to confirm sending recovery commands",
+    )
+    parser.add_argument("--prompt-regex", default=DEFAULT_PROMPT_RE)
+    parser.add_argument("--shell-timeout", type=float, default=8.0)
+    parser.add_argument(
+        "--kill-only",
+        action="store_true",
+        help="with --apply --yes, terminate affected children even when relaunch is unsafe",
     )
     args = parser.parse_args()
 
@@ -34,34 +198,62 @@ def main() -> int:
         return 0
 
     print("Tabs pinned to fresh quota walls:")
+    plans = []
     for tab in stuck:
+        valid, reason, meta = validate_cmux_surface(tab)
+        tab_home = tab_home_from(tab)
+        plans.append((tab, valid, reason, meta, tab_home))
         print(
             f"- tab={tab.get('tab_id', '?')} "
             f"email={tab.get('email', '?')} "
-            f"child={tab.get('child_pid', '-')}"
+            f"child={tab.get('child_pid', '-')} "
+            f"rescue={'ready' if valid and tab_home else 'blocked'} "
+            f"reason={reason}"
         )
 
     if not args.apply:
-        print("Run codex-rescue --apply --yes to terminate affected child processes.")
+        print("Run codex-rescue --apply --yes to relaunch validated cmux terminal tabs.")
         return 1
     if not args.yes:
         print("--apply requires --yes", file=sys.stderr)
         return 2
 
     failures = 0
-    for tab in stuck:
+    for tab, valid, reason, meta, tab_home in plans:
+        if not valid or tab_home is None:
+            print(f"not relaunching {tab.get('tab_id', '?')}: {reason}", file=sys.stderr)
+            if not args.kill_only:
+                failures += 1
+                continue
+
         child_pid = int(tab.get("child_pid") or 0)
-        if child_pid <= 0:
+        if child_pid > 0:
+            try:
+                os.kill(child_pid, signal.SIGTERM)
+                print(f"terminated child {child_pid} for {tab.get('email', '?')}")
+            except ProcessLookupError:
+                print(f"child already exited: {child_pid}")
+            except PermissionError:
+                failures += 1
+                print(f"permission denied terminating child {child_pid}", file=sys.stderr)
+                continue
+
+        if not valid or tab_home is None:
+            continue
+
+        workspace = meta["workspace_id"]
+        surface = meta["surface_id"]
+        ready, _screen = shell_ready(workspace, surface, args.prompt_regex, args.shell_timeout)
+        if not ready:
+            print(f"shell prompt not ready for {tab.get('tab_id', '?')}", file=sys.stderr)
             failures += 1
             continue
-        try:
-            os.kill(child_pid, signal.SIGTERM)
-            print(f"terminated child {child_pid} for {tab.get('email', '?')}")
-        except ProcessLookupError:
-            print(f"child already exited: {child_pid}")
-        except PermissionError:
+        sent, detail = send_recovery(home, tab_home, workspace, surface)
+        if sent:
+            print(f"sent recovery command for {tab.get('email', '?')}: {detail}")
+        else:
             failures += 1
-            print(f"permission denied terminating child {child_pid}", file=sys.stderr)
+            print(f"failed to send recovery command: {detail}", file=sys.stderr)
     return 1 if failures else 0
 
 

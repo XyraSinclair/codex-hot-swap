@@ -51,6 +51,34 @@ Check:
 
 The wrapper intentionally does not scrape terminal text for quota strings.
 
+## `codex-rescue` reports a stuck tab
+
+`codex-rescue` is report-only by default:
+
+```bash
+codex-rescue
+```
+
+For cmux-hosted tabs, `codex-safe` records workspace, pane, and surface metadata
+in `tab.json`. Rescue validates that the captured surface still exists, belongs
+to the captured pane, and is a terminal before sending anything. It then waits
+for a shell-looking prompt and sends:
+
+```bash
+CODEX_HOME=<home> codex-continue --tab-home <tab-home> --launch
+```
+
+Apply only after reading the report:
+
+```bash
+codex-rescue --apply --yes
+```
+
+If the tab was launched outside cmux, or the cmux surface is stale, missing, or
+not a terminal, rescue reports the problem and does not send keys. This is
+intentional; sending into the wrong pane is worse than requiring explicit
+manual recovery.
+
 ## A chat migrated but lost tool state
 
 Migration reconstructs context from rollout JSONL. Tool calls, tool outputs,

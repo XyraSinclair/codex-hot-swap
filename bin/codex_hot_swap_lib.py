@@ -669,20 +669,30 @@ def write_tab_state(
     status: str,
     migrations: int = 0,
 ) -> None:
+    cmux = {
+        "workspace_id": os.environ.get("CMUX_WORKSPACE_ID"),
+        "panel_id": os.environ.get("CMUX_PANEL_ID"),
+        "tab_id": os.environ.get("CMUX_TAB_ID"),
+        "surface_id": os.environ.get("CMUX_SURFACE_ID") or os.environ.get("CMUX_TAB_ID"),
+    }
+    cmux = {key: value for key, value in cmux.items() if value}
+    data = {
+        "tab_id": tab_id,
+        "email": account.email,
+        "account_key": account.key,
+        "auth_path": str(account.auth_path),
+        "argv": argv,
+        "wrapper_pid": wrapper_pid,
+        "child_pid": child_pid,
+        "status": status,
+        "migrations": migrations,
+        "updated_at": now(),
+    }
+    if cmux:
+        data["cmux"] = cmux
     write_json_atomic(
         tab_home / "tab.json",
-        {
-            "tab_id": tab_id,
-            "email": account.email,
-            "account_key": account.key,
-            "auth_path": str(account.auth_path),
-            "argv": argv,
-            "wrapper_pid": wrapper_pid,
-            "child_pid": child_pid,
-            "status": status,
-            "migrations": migrations,
-            "updated_at": now(),
-        },
+        data,
     )
 
 

@@ -62,6 +62,21 @@ case "$wrapped_home" in
 esac
 test -f "$wrapped_home/auth.json"
 
+: >"$fake_log"
+PATH="$repo/tests/fakes:$PATH" \
+  CODEX_HOME="$wrapper_home" \
+  CODEX_HOTSWAP_KEEP_TABS=1 \
+  CMUX_WORKSPACE_ID=workspace-1 \
+  CMUX_PANEL_ID=pane-1 \
+  CMUX_TAB_ID=surface-1 \
+  CMUX_SURFACE_ID=surface-1 \
+  FAKE_CODEX_LOG="$fake_log" \
+  ./bin/codex-safe "hello" >/dev/null
+cmux_wrapped_home="$(awk -F= '/^home=/{print $2; exit}' "$fake_log")"
+grep -q '"workspace_id": "workspace-1"' "$cmux_wrapped_home/tab.json"
+grep -q '"panel_id": "pane-1"' "$cmux_wrapped_home/tab.json"
+grep -q '"surface_id": "surface-1"' "$cmux_wrapped_home/tab.json"
+
 cat >"$wrapper_home/predictive_quota_walls.json" <<JSON
 {
   "written_at": $(python3 - <<'PY'
@@ -218,6 +233,85 @@ if CODEX_HOME="$wrapper_home" ./bin/codex-rescue >"$sandbox/rescue.out"; then
   exit 1
 fi
 grep -q "live-test" "$sandbox/rescue.out"
+grep -q "no cmux metadata" "$sandbox/rescue.out"
+
+cmux_home="$sandbox/cmux-home"
+mkdir -p "$cmux_home/accounts" "$cmux_home/tabs/cmux-tab"
+cat >"$cmux_home/accounts/registry.json" <<'JSON'
+{
+  "accounts": {
+    "a": {
+      "email": "a@example.com",
+      "auth_path": "a.auth.json",
+      "usage": {
+        "5h": {"used_percent": 100},
+        "weekly": {"used_percent": 100}
+      }
+    }
+  }
+}
+JSON
+printf '{}\n' >"$cmux_home/accounts/a.auth.json"
+cat >"$cmux_home/tabs/cmux-tab/tab.json" <<JSON
+{
+  "tab_id": "cmux-tab",
+  "email": "a@example.com",
+  "wrapper_pid": $$,
+  "child_pid": 0,
+  "status": "running",
+  "cmux": {
+    "workspace_id": "workspace-1",
+    "panel_id": "pane-1",
+    "tab_id": "surface-1",
+    "surface_id": "surface-1"
+  }
+}
+JSON
+cat >"$cmux_home/predictive_quota_walls.json" <<JSON
+{
+  "written_at": $(python3 - <<'PY'
+import time
+print(time.time())
+PY
+),
+  "accounts": {
+    "a@example.com": {
+      "email": "a@example.com",
+      "windows": {
+        "weekly": {
+          "remaining_percent": 0,
+          "resets_at": $(python3 - <<'PY'
+import time
+print(time.time() + 3600)
+PY
+)
+        }
+      }
+    }
+  }
+}
+JSON
+cmux_log="$sandbox/cmux.log"
+PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$cmux_home" FAKE_CMUX_LOG="$cmux_log" FAKE_CMUX_MODE=valid FAKE_CMUX_SCREEN='$ ' ./bin/codex-rescue --apply --yes >"$sandbox/cmux-rescue.out"
+grep -q "sent recovery command" "$sandbox/cmux-rescue.out"
+grep -q "codex-continue --tab-home" "$cmux_log"
+grep -q "send_key=.*Enter" "$cmux_log"
+
+: >"$cmux_log"
+if PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$cmux_home" FAKE_CMUX_LOG="$cmux_log" FAKE_CMUX_MODE=stale ./bin/codex-rescue --apply --yes >"$sandbox/cmux-stale.out" 2>"$sandbox/cmux-stale.err"; then
+  echo "rescue unexpectedly succeeded for stale cmux surface" >&2
+  exit 1
+fi
+grep -q "stale or missing" "$sandbox/cmux-stale.out"
+test ! "$(grep -c 'send_text=' "$cmux_log" 2>/dev/null || true)" -gt 0
+
+: >"$cmux_log"
+if PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$cmux_home" FAKE_CMUX_LOG="$cmux_log" FAKE_CMUX_MODE=nonterminal ./bin/codex-rescue --apply --yes >"$sandbox/cmux-nonterminal.out" 2>"$sandbox/cmux-nonterminal.err"; then
+  echo "rescue unexpectedly succeeded for nonterminal cmux surface" >&2
+  exit 1
+fi
+grep -q "not a terminal" "$sandbox/cmux-nonterminal.out"
+test ! "$(grep -c 'send_text=' "$cmux_log" 2>/dev/null || true)" -gt 0
 
 auth_log="$sandbox/codex-auth.log"
 PATH="$repo/tests/fakes:$PATH" CODEX_HOME="$wrapper_home" FAKE_CODEX_AUTH_LOG="$auth_log" FAKE_CODEX_AUTH_FAIL_IF_CALLED=1 ./bin/codex-predictive-daemon --once

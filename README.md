@@ -172,6 +172,7 @@ make check
 - [Safety model](docs/safety.md)
 - [Release gates](docs/release-gates.md)
 - [Codex compatibility](docs/codex-compatibility.md)
+- [cmux rescue](docs/cmux-rescue.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Roadmap](docs/roadmap.md)
 - [Contributing](CONTRIBUTING.md)

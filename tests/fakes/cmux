@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log="${FAKE_CMUX_LOG:-}"
+mode="${FAKE_CMUX_MODE:-valid}"
+screen="${FAKE_CMUX_SCREEN:-$ }"
+
+json=0
+if [ "${1:-}" = "--json" ]; then
+  json=1
+  shift
+fi
+
+cmd="${1:-}"
+shift || true
+
+if [ "$log" != "" ]; then
+  printf 'cmd=%s args=%s\n' "$cmd" "$*" >> "$log"
+fi
+
+case "$cmd" in
+  list-pane-surfaces)
+    case "$mode" in
+      valid)
+        cat <<'JSON'
+[{"id":"surface-1","uuid":"surface-1","ref":"surface:1","type":"terminal"}]
+JSON
+        ;;
+      stale)
+        printf '[]\n'
+        ;;
+      nonterminal)
+        cat <<'JSON'
+[{"id":"surface-1","uuid":"surface-1","ref":"surface:1","type":"browser"}]
+JSON
+        ;;
+      different)
+        cat <<'JSON'
+[{"id":"surface-other","uuid":"surface-other","ref":"surface:2","type":"terminal"}]
+JSON
+        ;;
+      *)
+        printf '%s\n' "$mode"
+        ;;
+    esac
+    ;;
+  read-screen)
+    printf '%s\n' "$screen"
+    ;;
+  send)
+    if [ "$log" != "" ]; then
+      printf 'send_text=%s\n' "$*" >> "$log"
+    fi
+    ;;
+  send-key)
+    if [ "$log" != "" ]; then
+      printf 'send_key=%s\n' "$*" >> "$log"
+    fi
+    ;;
+  *)
+    echo "unexpected fake cmux command: $cmd" >&2
+    exit 64
+    ;;
+esac
+
+exit 0
