@@ -51,8 +51,9 @@
 
 - Done: create GitHub repo `codex-hot-swap`.
 - Done: push public main branch.
-- Remaining: run all release gates.
-- Remaining: open issues for non-blocking v2 work.
+- Done: run automated v1 release gates.
+- Done: document release-gate evidence in `docs/release-audit.md`.
+- Done: open and resolve tracked hardening issues for v1.
 
 ## Phase 5: v2 Refresh Broker
 

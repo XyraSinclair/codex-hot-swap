@@ -9,9 +9,9 @@ wall. Running sessions get isolated auth snapshots, quota state comes from a
 structured cache, and context migration happens locally from append-only rollout
 logs.
 
-> Status: public staging repo. The core command surface is implemented and
-> covered by sandbox tests, but this should not be treated as production until
-> the full release gates in [docs/release-gates.md](docs/release-gates.md) pass.
+> Status: v1 automated release gates are green. The remaining major design item
+> is optional v2 strict refresh-token serialization, documented in
+> [docs/refresh-broker.md](docs/refresh-broker.md).
 
 ## Goal
 
@@ -38,6 +38,55 @@ the wrapper, enable smooth mode deliberately, and trust that `codex-status`
 tells the truth about accounts, live tabs, quota walls, daemon health, and
 recovery options. When automation cannot safely recover, the failure should be
 explicit and calm, not silent, destructive, or mysterious.
+
+## Quick Start
+
+Prerequisites:
+
+- macOS or Linux shell environment;
+- `python3`;
+- Codex CLI installed as `codex`;
+- a local multi-account Codex registry, typically from `codex-auth`, with
+  account vaults under `~/.codex/accounts/`.
+
+Install:
+
+```bash
+git clone https://github.com/XyraSinclair/codex-hot-swap.git
+cd codex-hot-swap
+make check
+./install.sh --dry-run
+./install.sh
+```
+
+Use without changing your shell aliases:
+
+```bash
+codex-safe
+codex-status
+```
+
+Optional alias:
+
+```bash
+./install.sh --with-alias
+```
+
+Optional daemon:
+
+```bash
+./install.sh --with-daemon
+```
+
+Optional smooth mode, which enables usage refresh polling and proactive
+migration:
+
+```bash
+codex-smooth-mode --enable
+```
+
+If live tabs are already running, smooth mode refuses unless you pass
+`--allow-live`.
 
 ## What This Solves
 
@@ -148,8 +197,8 @@ codex-safe live migration
 
 ## Release Gates
 
-This repo is not production-ready until the gates in
-[docs/release-gates.md](docs/release-gates.md) pass. In short:
+The automated v1 gates in [docs/release-gates.md](docs/release-gates.md) are
+mapped to evidence in [docs/release-audit.md](docs/release-audit.md). In short:
 
 - sandbox tests prove real credentials are never touched;
 - broad quota text in output cannot trigger migration;

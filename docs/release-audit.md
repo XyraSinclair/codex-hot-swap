@@ -74,6 +74,6 @@ lease mode that limits concurrent tabs per account.
 ## Current Release Status
 
 The automated v1 release gates are proven by `make check` and GitHub Actions.
-The repo remains labeled as a staging repo because the refresh-broker work is a
-known architectural v2 safety improvement, not because the current public code
-is untested.
+The refresh broker remains a documented v2 safety improvement for operators who
+want strict refresh-token serialization without relying on upstream Codex
+changes.
