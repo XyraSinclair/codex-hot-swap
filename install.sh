@@ -8,6 +8,7 @@ Codex Hot Swap installer
 
 Usage:
   ./install.sh [--dry-run] [--prefix DIR] [--codex-home DIR]
+  ./install.sh --trial [--dry-run]
   ./install.sh --with-daemon [--with-alias]
   ./install.sh --render-launchd-plist PATH
   ./install.sh --uninstall [--purge-config] [--dry-run]
@@ -16,6 +17,8 @@ Options:
   --dry-run        Show intended actions without changing files.
   --prefix DIR     Installation directory for scripts. Default: $HOME/bin.
   --codex-home DIR Codex home for config/launchd. Default: global Codex home.
+  --trial          Install binaries side-by-side under ~/.local without writing
+                   Codex config, shell startup files, or launchd state.
   --with-daemon    Install and start a macOS LaunchAgent for the daemon.
   --render-launchd-plist PATH
                    Render the daemon plist to PATH without bootstrapping launchd.
@@ -88,6 +91,8 @@ codex_home="${CODEX_GLOBAL_HOME:-${CODEX_HOME:-$HOME/.codex}}"
 if [ "$(basename "$(dirname "$codex_home")")" = "tabs" ]; then
   codex_home="$(dirname "$(dirname "$codex_home")")"
 fi
+prefix_was_set=0
+trial=0
 with_daemon=0
 with_alias=0
 uninstall=0
@@ -103,6 +108,7 @@ while [ "$#" -gt 0 ]; do
       shift
       [ "$#" -gt 0 ] || { echo "missing value for --prefix" >&2; exit 2; }
       prefix="$1"
+      prefix_was_set=1
       ;;
     --codex-home)
       shift
@@ -111,6 +117,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     --with-daemon)
       with_daemon=1
+      ;;
+    --trial)
+      trial=1
       ;;
     --render-launchd-plist)
       shift
@@ -139,12 +148,24 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+if [ "$trial" -eq 1 ]; then
+  if [ "$prefix_was_set" -eq 0 ]; then
+    prefix="$HOME/.local/codex-hot-swap/trial/bin"
+  fi
+  if [ "$with_daemon" -eq 1 ] || [ "$with_alias" -eq 1 ] || [ "$render_launchd_plist" != "" ]; then
+    die "--trial cannot be combined with daemon, alias, or launchd rendering"
+  fi
+fi
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 launchd_label="${CODEX_HOTSWAP_LAUNCHD_LABEL:-dev.codex-hot-swap.predictive}"
 plist_template="$script_dir/launchd/codex-hot-swap.plist.template"
 plist_path="$HOME/Library/LaunchAgents/${launchd_label}.plist"
 config_path="$codex_home/codex-hotswap.json"
 manifest_path="$codex_home/codex-hotswap-install-manifest.json"
+if [ "$trial" -eq 1 ]; then
+  manifest_path="$prefix/.codex-hot-swap-install-manifest.json"
+fi
 launchd_path="$prefix:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
 python_bin="${PYTHON:-}"
 scripts=(
@@ -347,6 +368,9 @@ PY
 }
 
 remove_launchd_plist() {
+  if [ "$trial" -eq 1 ]; then
+    return 0
+  fi
   [ -e "$plist_path" ] || return 0
   if [ "$dry_run" -eq 1 ]; then
     log "dry-run: would launchctl bootout gui/$(id -u) $plist_path"
@@ -403,10 +427,14 @@ uninstall_installation() {
     warn "leaving unmanaged or modified file in place: $target"
   done
 
-  remove_public_alias_block
+  if [ "$trial" -eq 0 ]; then
+    remove_public_alias_block
+  fi
   remove_launchd_plist
 
-  if [ "$purge_config" -eq 1 ]; then
+  if [ "$trial" -eq 1 ]; then
+    :
+  elif [ "$purge_config" -eq 1 ]; then
     [ ! -e "$config_path" ] || run rm -f "$config_path"
   elif [ -e "$config_path" ]; then
     log "keeping config: $config_path"
@@ -435,11 +463,16 @@ fi
 echo "Codex Hot Swap installer"
 echo "prefix: $prefix"
 echo "CODEX_HOME: $codex_home"
+if [ "$trial" -eq 1 ]; then
+  echo "mode: trial side-by-side install"
+fi
 
 check_install_collisions
 
 run mkdir -p "$prefix"
-run mkdir -p "$codex_home"
+if [ "$trial" -eq 0 ]; then
+  run mkdir -p "$codex_home"
+fi
 
 for script in "${scripts[@]}"; do
   run install -m 0755 "$script_dir/bin/$script" "$prefix/$script"
@@ -451,7 +484,9 @@ else
   write_manifest
 fi
 
-if [ ! -e "$config_path" ]; then
+if [ "$trial" -eq 1 ]; then
+  log "trial mode: not writing Codex config"
+elif [ ! -e "$config_path" ]; then
   write_file "$config_path" 600 '{
   "threshold_5h_percent": 25,
   "threshold_weekly_percent": 15,
@@ -504,7 +539,22 @@ if [ "$with_daemon" -eq 1 ]; then
   fi
 fi
 
-cat <<'SUMMARY'
+if [ "$trial" -eq 1 ]; then
+  cat <<SUMMARY
+
+Trial install complete.
+
+This did not edit shell startup files, launchd, Codex config, accounts, tabs, or
+rollouts. Try commands by absolute path:
+
+  "$prefix/codex-safe" --help
+  CODEX_HOME="\$HOME/.codex" "$prefix/codex-status"
+
+Uninstall this trial:
+  ./install.sh --trial --uninstall
+SUMMARY
+else
+  cat <<'SUMMARY'
 
 Install complete.
 
@@ -519,3 +569,4 @@ Uninstall keeps codex-hotswap.json by default and never removes accounts,
 credentials, tab homes, or rollout logs. Use --purge-config to remove only this
 tool's config file too.
 SUMMARY
+fi

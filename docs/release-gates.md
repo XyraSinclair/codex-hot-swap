@@ -6,6 +6,9 @@ This checklist defines what "shippable" means for Codex Hot Swap.
 
 - `./install.sh --dry-run` prints intended actions and changes nothing.
 - `./install.sh` copies scripts/config only.
+- `./install.sh --trial` installs scripts side-by-side without writing Codex
+  config, shell rc files, launchd state, credentials, account vaults, tab homes,
+  or rollout logs.
 - If run from inside a wrapped Codex tab, install targets the global Codex home,
   not the per-tab `CODEX_HOME`.
 - `./install.sh` refuses to overwrite unmanaged same-name files.

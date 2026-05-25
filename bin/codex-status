@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from datetime import datetime, timezone
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -41,6 +42,29 @@ def is_stale(epoch: float | int | None, max_age: float) -> bool:
     return time.time() - float(epoch) > max_age
 
 
+def state_timestamp(doc: object) -> float | None:
+    if not isinstance(doc, dict):
+        return None
+    for key in ("written_at", "updated_at", "timestamp"):
+        value = doc.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            pass
+    value = doc.get("updated_at_iso")
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    return None
+
+
 def main() -> int:
     home = codex_home()
     config = load_config(home)
@@ -49,8 +73,8 @@ def main() -> int:
     tabs = live_tabs(home)
     predictive = load_json(home / "predictive_state.json", {})
     wall_raw = load_json(wall_cache_path(home), {})
-    predictive_written = predictive.get("written_at") if isinstance(predictive, dict) else None
-    wall_written = wall_raw.get("written_at") if isinstance(wall_raw, dict) else None
+    predictive_written = state_timestamp(predictive)
+    wall_written = state_timestamp(wall_raw)
     daemon_stale = is_stale(
         predictive_written,
         max(float(config.get("poll_interval_seconds", 60)) * 3, 180),

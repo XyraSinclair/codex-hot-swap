@@ -11,6 +11,7 @@ The library is deliberately conservative:
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import fcntl
 import json
@@ -253,7 +254,12 @@ def _iter_registry_records(data: Any) -> Iterable[tuple[str, dict[str, Any]]]:
     if isinstance(accounts, list):
         for idx, item in enumerate(accounts):
             if isinstance(item, dict):
-                yield str(item.get("key") or item.get("id") or idx), item
+                yield str(
+                    item.get("key")
+                    or item.get("account_key")
+                    or item.get("id")
+                    or idx
+                ), item
         return
     if isinstance(accounts, dict):
         for key, item in accounts.items():
@@ -288,10 +294,22 @@ def _auth_path_for_record(home: Path, key: str, record: dict[str, Any]) -> Path:
         if isinstance(value, str) and value:
             path = Path(value).expanduser()
             return path if path.is_absolute() else accounts_dir(home) / path
-    for candidate in (
-        accounts_dir(home) / f"{key}.auth.json",
-        accounts_dir(home) / f"{record.get('id', key)}.auth.json",
-    ):
+    candidate_names = [
+        key,
+        str(record.get("account_key") or ""),
+        str(record.get("id") or ""),
+        str(record.get("chatgpt_account_id") or ""),
+    ]
+    account_key = record.get("account_key")
+    if isinstance(account_key, str):
+        encoded_key = (
+            base64.urlsafe_b64encode(account_key.encode("utf-8"))
+            .decode("ascii")
+            .rstrip("=")
+        )
+        candidate_names.append(encoded_key)
+    for candidate_name in dict.fromkeys(name for name in candidate_names if name):
+        candidate = accounts_dir(home) / f"{candidate_name}.auth.json"
         if candidate.exists():
             return candidate
     return accounts_dir(home) / f"{key}.auth.json"
@@ -347,8 +365,15 @@ def _find_window(record: dict[str, Any], names: tuple[str, ...]) -> tuple[float 
             if remaining is not None:
                 return remaining, None
 
-    usage = record.get("usage")
-    if isinstance(usage, dict):
+    usage_sources = (
+        record.get("usage"),
+        record.get("last_usage"),
+        record.get("quota"),
+        record.get("limits"),
+    )
+    for usage in usage_sources:
+        if not isinstance(usage, dict):
+            continue
         for name in names:
             if name in usage:
                 remaining, reset = _remaining_from_window(usage[name])
@@ -389,8 +414,10 @@ def live_tabs(home: Path) -> list[dict[str, Any]]:
         if not isinstance(data, dict):
             continue
         wrapper_pid = data.get("wrapper_pid")
-        child_pid = data.get("child_pid")
+        child_pid = data.get("child_pid") or data.get("pid")
         if pid_alive(int(wrapper_pid or 0)) or pid_alive(int(child_pid or 0)):
+            data.setdefault("email", data.get("pinned_email"))
+            data.setdefault("child_pid", child_pid)
             data["_tab_file"] = str(tab_file)
             tabs.append(data)
     return tabs

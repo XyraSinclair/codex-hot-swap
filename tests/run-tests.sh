@@ -518,6 +518,14 @@ grep -q "broken@example.com.*broken" "$sandbox/status.out"
 grep -q "missing@example.com.*missing-vault" "$sandbox/status.out"
 grep -q "walled@example.com.*walled" "$sandbox/status.out"
 
+python3 - <<PY >"$status_home/predictive_state.json"
+from datetime import datetime, timezone
+import json
+print(json.dumps({"updated_at_iso": datetime.now(timezone.utc).isoformat()}))
+PY
+CODEX_HOME="$status_home" ./bin/codex-status >"$sandbox/status-iso.out"
+grep -q "daemon: fresh" "$sandbox/status-iso.out"
+
 migrate_home="$sandbox/migrate-home"
 mkdir -p "$migrate_home/accounts" "$migrate_home/sessions"
 cat >"$migrate_home/accounts/registry.json" <<'JSON'
@@ -597,6 +605,26 @@ grep -q "automatically migrated" "$migrate_log"
 HOME="$sandbox/home" CODEX_GLOBAL_HOME= CODEX_HOME="$sandbox/home/codex" PREFIX="$sandbox/home/bin" ./install.sh --dry-run >"$sandbox/dry-run.out"
 test ! -e "$sandbox/home/bin/codex-safe"
 test ! -e "$sandbox/home/Library/LaunchAgents"
+
+trial_home="$sandbox/trial-home"
+HOME="$trial_home/home" CODEX_GLOBAL_HOME= CODEX_HOME="$trial_home/real-codex" ./install.sh --trial >"$sandbox/trial-install.out"
+test -x "$trial_home/home/.local/codex-hot-swap/trial/bin/codex-safe"
+test -x "$trial_home/home/.local/codex-hot-swap/trial/bin/codex-status"
+test -f "$trial_home/home/.local/codex-hot-swap/trial/bin/.codex-hot-swap-install-manifest.json"
+test ! -e "$trial_home/real-codex/codex-hotswap.json"
+test ! -e "$trial_home/home/.zshrc"
+test ! -e "$trial_home/home/Library/LaunchAgents"
+grep -q "Trial install complete" "$sandbox/trial-install.out"
+
+if HOME="$trial_home/home" CODEX_GLOBAL_HOME= CODEX_HOME="$trial_home/real-codex" ./install.sh --trial --with-alias >"$sandbox/trial-alias.out" 2>"$sandbox/trial-alias.err"; then
+  echo "trial mode unexpectedly accepted --with-alias" >&2
+  exit 1
+fi
+grep -q "cannot be combined" "$sandbox/trial-alias.err"
+
+HOME="$trial_home/home" CODEX_GLOBAL_HOME= CODEX_HOME="$trial_home/real-codex" ./install.sh --trial --uninstall >"$sandbox/trial-uninstall.out"
+test ! -e "$trial_home/home/.local/codex-hot-swap/trial/bin/codex-safe"
+test ! -e "$trial_home/real-codex/codex-hotswap.json"
 
 tab_global_home="$sandbox/tab-global/codex"
 mkdir -p "$tab_global_home/tabs/tab-1"

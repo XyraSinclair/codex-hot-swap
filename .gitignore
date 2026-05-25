@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.log
 tmp/
+local/
 
 # Local Codex credentials and state.
 auth.json

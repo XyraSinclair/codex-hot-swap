@@ -55,6 +55,8 @@ Install:
 git clone https://github.com/XyraSinclair/codex-hot-swap.git
 cd codex-hot-swap
 make check
+./install.sh --trial --dry-run
+./install.sh --trial
 ./install.sh --dry-run
 ./install.sh
 ```
@@ -72,6 +74,13 @@ Use without changing your shell aliases:
 ```bash
 codex-safe
 codex-status
+```
+
+Use a side-by-side trial without changing the active `codex` command:
+
+```bash
+"$HOME/.local/codex-hot-swap/trial/bin/codex-safe" --help
+CODEX_HOME="$HOME/.codex" "$HOME/.local/codex-hot-swap/trial/bin/codex-status"
 ```
 
 Optional alias:
@@ -172,6 +181,7 @@ The final installer must be safe by default:
 
 ```bash
 ./install.sh --dry-run
+./install.sh --trial
 ./install.sh
 ./install.sh --uninstall
 ```
@@ -240,6 +250,7 @@ make check
 - [Safety model](docs/safety.md)
 - [Release gates](docs/release-gates.md)
 - [Release audit](docs/release-audit.md)
+- [Safe side-by-side trial](docs/safe-trial.md)
 - [Codex compatibility](docs/codex-compatibility.md)
 - [cmux rescue](docs/cmux-rescue.md)
 - [Refresh broker design](docs/refresh-broker.md)

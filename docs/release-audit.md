@@ -18,6 +18,9 @@ Codex/fake codex-auth/fake cmux integration tests, installer tests, and
 | --- | --- | --- |
 | `./install.sh --dry-run` changes nothing | `tests/run-tests.sh` verifies no installed `codex-safe` after dry-run | Proven |
 | Default install copies scripts/config only | `tests/run-tests.sh` checks installed scripts/config and no `.zshrc` or LaunchAgents | Proven |
+| Trial install is side-by-side and non-invasive | `tests/run-tests.sh` verifies `--trial` installs under `~/.local`, writes no Codex config, no `.zshrc`, and no LaunchAgents | Proven |
+| Trial mode rejects alias/daemon-style integration | `tests/run-tests.sh` verifies `--trial --with-alias` aborts | Proven |
+| Trial uninstall removes only the trial prefix files | `tests/run-tests.sh` verifies `--trial --uninstall` removes trial scripts and does not touch Codex config | Proven |
 | Installer does not treat a wrapped tab home as the global Codex home | `tests/run-tests.sh` sets `CODEX_HOME` to `.../tabs/<id>` and verifies install defaults to its parent global home | Proven |
 | Installer refuses to overwrite unmanaged files | `tests/run-tests.sh` plants a legacy `codex-safe` and verifies install aborts without modifying it | Proven |
 | Install writes an ownership manifest | `tests/run-tests.sh` checks `codex-hotswap-install-manifest.json` after install | Proven |
@@ -55,6 +58,9 @@ Codex/fake codex-auth/fake cmux integration tests, installer tests, and
 | Non-cmux/stale surfaces degrade to reporting | Fake non-cmux and stale cmux tests send nothing | Proven |
 | Status reports remaining quota terms | `codex-status` displays 5h/weekly remaining percentages | Proven by code inspection and status test |
 | Status distinguishes broken/walled/low/stale/unknown | Status integration test checks all flags and stale daemon/fresh wall cache | Proven |
+| Status handles current `codex-auth` registry shape | Unit test covers list-shaped `accounts`, `account_key` vault filenames, and `last_usage.primary/secondary` windows | Proven |
+| Status handles older wrapper tab metadata | Unit test covers `pinned_email` plus `pid` tab metadata | Proven |
+| Status handles older daemon timestamps | `tests/run-tests.sh` verifies `updated_at_iso` is accepted for daemon freshness | Proven |
 | Status never prints tokens | Status reads registry metadata, wall cache, predictive state, and tab state; it never opens auth vaults | Proven by code inspection |
 | README and docs explain safe install, smooth mode, token risk, usage polling, daemon/wrapper split, and troubleshooting | README plus `docs/safety.md`, `docs/architecture.md`, `docs/troubleshooting.md` | Proven |
 

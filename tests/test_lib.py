@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+import base64
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -16,6 +17,7 @@ from codex_hot_swap_lib import (  # noqa: E402
     account_states,
     codex_interactive_prompt_supported,
     latest_rollout_from_sqlite,
+    live_tabs,
     load_config,
     mark_broken,
     pick_account,
@@ -68,6 +70,42 @@ class HotSwapLibTests(unittest.TestCase):
         self.assertEqual(states["a@example.com"].remaining_5h, 90)
         self.assertEqual(states["a@example.com"].remaining_weekly, 80)
         self.assertEqual(states["b@example.com"].remaining_5h, 0)
+
+    def test_codex_auth_list_registry_uses_account_key_and_last_usage(self) -> None:
+        future = time.time() + 3600
+        account_key = "encoded-account-key::account-uuid"
+        filename_key = base64.urlsafe_b64encode(
+            account_key.encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        registry = {
+            "accounts": [
+                {
+                    "account_key": account_key,
+                    "email": "list@example.com",
+                    "last_usage": {
+                        "primary": {"used_percent": 25, "resets_at": future},
+                        "secondary": {"used_percent": 75, "resets_at": future},
+                    },
+                }
+            ]
+        }
+        (self.home / "accounts" / "registry.json").write_text(
+            json.dumps(registry),
+            encoding="utf-8",
+        )
+        (self.home / "accounts" / f"{filename_key}.auth.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+
+        states = account_states(self.home)
+        self.assertEqual(len(states), 1)
+        state = states[0]
+        self.assertEqual(state.email, "list@example.com")
+        self.assertTrue(state.auth_exists)
+        self.assertEqual(state.auth_path.name, f"{filename_key}.auth.json")
+        self.assertEqual(state.remaining_5h, 75)
+        self.assertEqual(state.remaining_weekly, 25)
 
     def test_wall_cache_uses_fresh_zero_remaining_with_future_reset(self) -> None:
         states = account_states(self.home)
@@ -149,6 +187,25 @@ class HotSwapLibTests(unittest.TestCase):
                 walled={"b@example.com"},
             )
         )
+
+    def test_live_tabs_accepts_legacy_pinned_email_and_pid(self) -> None:
+        tab_home = self.home / "tabs" / "legacy-tab"
+        tab_home.mkdir(parents=True)
+        (tab_home / "tab.json").write_text(
+            json.dumps(
+                {
+                    "tab_id": "legacy-tab",
+                    "pinned_email": "a@example.com",
+                    "wrapper_pid": os.getpid(),
+                    "pid": 123456789,
+                }
+            ),
+            encoding="utf-8",
+        )
+        tabs = live_tabs(self.home)
+        self.assertEqual(len(tabs), 1)
+        self.assertEqual(tabs[0]["email"], "a@example.com")
+        self.assertEqual(tabs[0]["child_pid"], 123456789)
 
     def test_proactive_migration_uses_cached_registry_state(self) -> None:
         config = load_config(self.home)
