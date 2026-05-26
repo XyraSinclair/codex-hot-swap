@@ -676,12 +676,96 @@ def ensure_tab_home(tab_home: Path, home: Path) -> None:
         (tab_home / name).mkdir(exist_ok=True)
 
 
+def _vault_filename_for_key(account_key: str) -> str:
+    """Return the base64url filename codex stores an account's vault under.
+
+    Codex 0.132+ looks up accounts/<base64url(account_key)>.auth.json based
+    on the active_account_key from accounts/registry.json. Padding stripped,
+    URL-safe alphabet.
+    """
+    return base64.urlsafe_b64encode(account_key.encode("utf-8")).rstrip(b"=").decode("ascii")
+
+
+def _write_per_tab_registry(home: Path, account: AccountState, tab_accounts: Path) -> None:
+    """Materialise per-tab accounts/ with ONLY the chosen account active.
+
+    CRITICAL for codex 0.132+: codex picks the active account from
+    accounts/registry.json (active_account_key), then loads
+    accounts/<base64url(key)>.auth.json for the token. If the tab inherits
+    the global accounts/ directory (via symlink or default fallback), the
+    GLOBAL active_account_key overrides whatever vault we copied at the
+    top level — every tab effectively uses one shared account regardless
+    of which vault the wrapper picked.
+
+    Per-tab accounts/ with a single-account registry pins codex to the
+    chosen account unambiguously: top-level auth.json, accounts/registry,
+    and the per-account vault file all agree.
+    """
+    global_reg = load_json(registry_path(home), default={})
+    if not isinstance(global_reg, dict):
+        global_reg = {}
+
+    chosen_record: dict[str, Any] | None = None
+    for _key, record in _iter_registry_records(global_reg):
+        rec_email = _email_for_record(_key, record)
+        if rec_email.lower() == account.email.lower():
+            chosen_record = dict(record)
+            break
+    if chosen_record is None:
+        chosen_record = dict(account.raw) if account.raw else {
+            "email": account.email,
+            "account_key": account.key,
+            "auth_mode": "chatgpt",
+        }
+
+    key = chosen_record.get("account_key") or account.key
+    if not key:
+        raise RuntimeError(f"no account_key for {account.email}")
+    # Some registry schemas omit account_key inside the record (using a
+    # top-level keyed dict instead). Inline it so codex-auth tooling that
+    # iterates the accounts array still finds the key.
+    chosen_record["account_key"] = key
+
+    per_tab_reg = dict(global_reg)
+    per_tab_reg["accounts"] = [chosen_record]
+    per_tab_reg["active_account_key"] = key
+    per_tab_reg["active_account_activated_at_ms"] = int(time.time() * 1000)
+    write_json_atomic(tab_accounts / "registry.json", per_tab_reg, mode=0o600)
+
+    # Place the chosen account's vault under the codex-expected filename.
+    dest = tab_accounts / f"{_vault_filename_for_key(str(key))}.auth.json"
+    try:
+        shutil.copy2(account.auth_path, dest)
+        os.chmod(dest, 0o600)
+    except OSError:
+        pass
+
+    # Share the recovery directory (broken ledger, etc.) with the global home.
+    global_recover = accounts_dir(home) / "recover"
+    try:
+        global_recover.mkdir(parents=True, mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    try:
+        os.symlink(global_recover, tab_accounts / "recover", target_is_directory=True)
+    except (FileExistsError, OSError):
+        pass
+
+
 def create_tab_home(home: Path, account: AccountState) -> tuple[str, Path]:
     tab_id = str(uuid.uuid4())
     tab_home = home / "tabs" / tab_id
     ensure_tab_home(tab_home, home)
     shutil.copy2(account.auth_path, tab_home / "auth.json")
     os.chmod(tab_home / "auth.json", 0o600)
+    # Per-tab accounts/ with a single-account registry. Without this, codex
+    # 0.132+ reads the global registry's active_account_key and uses that
+    # account regardless of which auth.json we copied above — i.e. the
+    # wrapper "pins to gmail" but codex actually runs as proton. This is
+    # the root cause of the multi-account hot-swap appearing broken.
+    tab_accounts = tab_home / "accounts"
+    tab_accounts.mkdir(mode=0o700, exist_ok=True)
+    _write_per_tab_registry(home, account, tab_accounts)
     return tab_id, tab_home
 
 

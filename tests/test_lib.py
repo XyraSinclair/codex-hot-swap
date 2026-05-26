@@ -14,8 +14,10 @@ REPO = Path(__file__).resolve().parents[1]
 os.sys.path.insert(0, str(REPO / "bin"))
 
 from codex_hot_swap_lib import (  # noqa: E402
+    _vault_filename_for_key,
     account_states,
     codex_interactive_prompt_supported,
+    create_tab_home,
     latest_rollout_from_sqlite,
     live_tabs,
     load_config,
@@ -239,6 +241,34 @@ class HotSwapLibTests(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(latest_rollout_from_sqlite(self.home), new_rollout)
+
+    def test_create_tab_home_pins_account_via_per_tab_registry(self) -> None:
+        """Regression: pre-v0.1.4 tabs inherited the global active_account_key,
+        so codex picked the wrong account regardless of which auth.json the
+        wrapper copied. The per-tab accounts/ dir with a single-account
+        registry forces codex to use exactly the chosen account.
+        """
+        states = {state.email: state for state in account_states(self.home)}
+        chosen = states["a@example.com"]
+        tab_id, tab_home = create_tab_home(self.home, chosen)
+
+        # Top-level auth.json copied from chosen vault.
+        self.assertTrue((tab_home / "auth.json").is_file())
+
+        # Per-tab accounts dir exists as a real directory (NOT a symlink to global).
+        tab_accounts = tab_home / "accounts"
+        self.assertTrue(tab_accounts.is_dir())
+        self.assertFalse(tab_accounts.is_symlink())
+
+        # Per-tab registry pins active_account_key to ONLY the chosen account.
+        reg = json.loads((tab_accounts / "registry.json").read_text())
+        self.assertEqual(len(reg["accounts"]), 1)
+        self.assertEqual(reg["accounts"][0]["email"], "a@example.com")
+        self.assertEqual(reg["active_account_key"], reg["accounts"][0]["account_key"])
+
+        # The per-account vault is copied under the codex-expected base64url filename.
+        expected_vault = tab_accounts / f"{_vault_filename_for_key(reg['active_account_key'])}.auth.json"
+        self.assertTrue(expected_vault.is_file())
 
     def test_codex_interactive_prompt_probe(self) -> None:
         fake_path = REPO / "tests" / "fakes"
