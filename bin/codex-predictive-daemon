@@ -1,126 +1,298 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-
-from codex_hot_swap_lib import (  # noqa: E402
+from codex_hot_swap_lib import (
+    AccountState,
     account_states,
-    codex_home,
+    active_state,
+    codex_base,
     live_tabs,
-    load_json,
     load_config,
-    pick_account,
+    pct,
     quota_walled_emails,
-    run_usage_refresh_if_enabled,
+    rank_accounts,
+    switch_default,
+    write_next_pick_hint,
+    write_state,
+    read_json,
     write_json_atomic,
-    write_quota_wall_cache,
 )
 
 
-def maybe_switch_default(home: Path, config: dict, states) -> dict:
-    if not config.get("switch_default", False):
-        return {"performed": False, "reason": "disabled", "target": None}
-    if live_tabs(home):
-        return {"performed": False, "reason": "live-tabs", "target": None}
-    walled = quota_walled_emails(home, config)
-    target = pick_account(states, config, walled=walled)
-    if target is None:
-        return {"performed": False, "reason": "no-usable-account", "target": None}
+LOG_MAX_BYTES = 10 * 1024 * 1024
 
-    previous = load_json(home / "predictive_state.json", {})
-    previous_email = None
-    if isinstance(previous, dict):
-        previous_email = previous.get("selected_default_email")
-    if isinstance(previous_email, str) and previous_email.lower() != target.email.lower():
-        current = next(
-            (state for state in states if state.email.lower() == previous_email.lower()),
-            None,
-        )
-        tolerance = float(config.get("load_balance_tolerance_pct", 15) or 0)
-        if (
-            current is not None
-            and current.auth_exists
-            and not current.broken
-            and current.email.lower() not in walled
-            and target.usable_remaining - current.usable_remaining < tolerance
-        ):
-            return {
-                "performed": False,
-                "reason": "within-tolerance",
-                "target": current.email,
-                "candidate": target.email,
-            }
 
-    env = dict(os.environ)
-    env["CODEX_HOME"] = str(home)
+def log_path(base: Path) -> Path:
+    return base / "predictive.log"
+
+
+def log(base: Path, message: str) -> None:
+    path = log_path(base)
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        result = subprocess.run(
-            ["codex-auth", "switch", target.email],
-            stdin=subprocess.DEVNULL,
+        if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+            backup = path.with_suffix(".log.1")
+            if backup.exists():
+                backup.unlink()
+            path.rename(backup)
+    except Exception:
+        pass
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with path.open("a") as fh:
+        fh.write(f"{stamp} {message}\n")
+
+
+def refresh_usage(base: Path, cfg: dict) -> None:
+    if not cfg.get("refresh_codex_auth_usage", True):
+        return
+    if os.environ.get("CODEX_PREDICTIVE_SKIP_CODEX_AUTH") == "1":
+        return
+    if shutil.which("codex-auth") is None:
+        return
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(base)
+    try:
+        subprocess.run(
+            ["codex-auth", "list"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=20,
             env=env,
-            timeout=60,
-            check=False,
         )
-        if result.returncode == 0:
-            return {"performed": True, "reason": "switched", "target": target.email}
-        return {
-            "performed": False,
-            "reason": f"codex-auth-exit-{result.returncode}",
-            "target": target.email,
-        }
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return {"performed": False, "reason": "codex-auth-unavailable", "target": target.email}
+    except Exception as exc:
+        log(base, f"usage refresh skipped: {exc}")
 
 
-def tick(home: Path, once: bool = False) -> None:
-    config = load_config(home)
-    refreshed = run_usage_refresh_if_enabled(home, config)
-    states = account_states(home, config)
-    walls = write_quota_wall_cache(home, states)
-    switch = maybe_switch_default(home, config, states)
-    write_json_atomic(
-        home / "predictive_state.json",
-        {
-            "written_at": time.time(),
-            "once": once,
-            "usage_refresh_attempted": bool(config.get("refresh_codex_auth_usage")),
-            "usage_refreshed": refreshed,
-            "global_switch_attempted": bool(config.get("switch_default", False)),
-            "global_switch_performed": bool(switch.get("performed")),
-            "global_switch_reason": switch.get("reason"),
-            "selected_default_email": switch.get("target"),
-            "candidate_default_email": switch.get("candidate"),
-            "account_count": len(states),
-            "wall_count": len(walls.get("accounts", {})),
-            "live_tab_count": len(live_tabs(home)),
-        },
+def under_threshold(state: AccountState, cfg: dict) -> bool:
+    rem_5h = state.remaining_5h_pct
+    rem_weekly = state.remaining_weekly_pct
+    return (
+        rem_5h is not None
+        and rem_5h < cfg["threshold_5h_percent"]
+    ) or (
+        rem_weekly is not None
+        and rem_weekly < cfg["threshold_weekly_percent"]
     )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Maintain Codex Hot Swap cached state")
-    parser.add_argument("--once", action="store_true", help="run one polling tick and exit")
-    args = parser.parse_args()
+def notify(title: str, body: str) -> None:
+    if sys.platform != "darwin":
+        return
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display notification "{body.replace(chr(34), chr(39))}" with title "{title.replace(chr(34), chr(39))}"',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except Exception:
+        pass
 
-    home = codex_home()
-    if args.once:
-        tick(home, once=True)
+
+def warning_state_path(base: Path) -> Path:
+    return base / "predictive_warning_state.json"
+
+
+def maybe_notify_all_accounts_low(base: Path, states: list[AccountState], cfg: dict) -> None:
+    usable = [s for s in states if not s.broken and s.vault_path is not None]
+    if not usable:
+        return
+    low = [
+        s
+        for s in usable
+        if (
+            s.remaining_5h_pct is not None
+            and s.remaining_5h_pct < cfg["all_accounts_warning_5h_percent"]
+        )
+        or (
+            s.remaining_weekly_pct is not None
+            and s.remaining_weekly_pct < cfg["all_accounts_warning_weekly_percent"]
+        )
+    ]
+    if len(low) != len(usable):
+        return
+
+    key = ",".join(sorted(s.email for s in usable))
+    state_path = warning_state_path(base)
+    state = read_json(state_path)
+    now = int(time.time())
+    if state.get("key") == key and now - int(state.get("last_notified_at", 0) or 0) < 15 * 60:
+        return
+
+    summary = ", ".join(
+        f"{s.email}:5h={pct(s.remaining_5h_pct)},weekly={pct(s.remaining_weekly_pct)}"
+        for s in usable
+    )
+    msg = (
+        "all usable Codex accounts are near capacity; add or re-OAuth another account. "
+        f"{summary}"
+    )
+    log(base, msg)
+    if cfg.get("notify", True):
+        notify("Codex account capacity low", msg[:220])
+    write_json_atomic(state_path, {"key": key, "last_notified_at": now, "message": msg}, mode=0o600)
+
+
+def maybe_notify_low_redundancy(base: Path, states: list[AccountState], cfg: dict) -> None:
+    usable = [s for s in states if not s.broken and s.vault_path is not None]
+    minimum = int(cfg.get("min_usable_accounts_warning", 2))
+    if len(usable) >= minimum:
+        return
+    state_path = base / "predictive_redundancy_warning_state.json"
+    state = read_json(state_path)
+    key = ",".join(sorted(s.email for s in usable)) or "none"
+    now = int(time.time())
+    if state.get("key") == key and now - int(state.get("last_notified_at", 0) or 0) < 15 * 60:
+        return
+    msg = (
+        f"only {len(usable)} usable Codex account(s); target is {minimum}. "
+        "Re-OAuth a broken account or add another account before the last chain hits quota/auth failure."
+    )
+    log(base, msg)
+    if cfg.get("notify", True):
+        notify("Codex account redundancy low", msg)
+    write_json_atomic(state_path, {"key": key, "last_notified_at": now, "message": msg}, mode=0o600)
+
+
+def maybe_write_live_tab_wall_notice(base: Path, states: list[AccountState]) -> None:
+    """For each live tab pinned to a walled account, write a tab-local notice.
+
+    The notice is a tiny file at <tab_home>/.walled-notice that the user's
+    status line / menubar can poll. We do NOT kill tabs — that would destroy
+    in-flight work. We just surface a flag so the user knows which tabs are
+    serving walls and can close them at their leisure.
+    """
+    walled = quota_walled_emails(base)
+    if not walled:
+        return
+    tabs = live_tabs(base)
+    walled_state_by_email = {s.email: s for s in states if s.email in walled}
+    for tab in tabs:
+        if tab.pinned_email not in walled:
+            # Account is healthy: clear any stale notice from a prior wall.
+            stale = tab.path / ".walled-notice"
+            try:
+                if stale.exists():
+                    stale.unlink()
+            except OSError:
+                pass
+            continue
+        notice = {
+            "tab_id": tab.tab_id,
+            "pinned_email": tab.pinned_email,
+            "noticed_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "advice": "This tab is pinned to a quota-walled account. New messages will hit 'usage limit'. Close it and start a new chat to land on a fresh account.",
+        }
+        try:
+            write_json_atomic(tab.path / ".walled-notice", notice, mode=0o600)
+        except Exception as exc:
+            log(base, f"walled-notice write failed for tab {tab.tab_id}: {exc!r}")
+
+
+def poll_once(base: Path) -> int:
+    cfg = load_config(base)
+    refresh_usage(base, cfg)
+    doc = write_state(base)
+    states = account_states(base)
+    active = active_state(states)
+    ranked = rank_accounts(states, config=cfg)
+    log(base, f"poll ok ranked={','.join(doc.get('ranked_for_new_tab', [])) or 'none'}")
+    maybe_notify_all_accounts_low(base, states, cfg)
+    maybe_notify_low_redundancy(base, states, cfg)
+    maybe_write_live_tab_wall_notice(base, states)
+
+    # Pre-compute the next pick so the wrapper's cold-start is a single-file
+    # read instead of a full state rebuild. The wrapper falls back to its
+    # own ranker if the hint is stale or excluded.
+    usable_ranked = [s for s in ranked if not s.broken and s.vault_path is not None]
+    if usable_ranked:
+        try:
+            write_next_pick_hint(usable_ranked[0].email, base)
+        except Exception as exc:
+            log(base, f"next-pick hint write failed: {exc!r}")
+
+    if not cfg.get("switch_default", True):
+        return 0
+    if active is None:
+        log(base, "no active account")
+        return 0
+    if not under_threshold(active, cfg):
         return 0
 
+    usable = [s for s in ranked if not s.broken and s.vault_path is not None]
+    if not usable:
+        log(base, f"active {active.email} below threshold; no usable account")
+        return 0
+    all_low = all(under_threshold(s, cfg) for s in usable)
+    if all_low:
+        msg = (
+            f"all accounts below thresholds "
+            f"(5h<{cfg['threshold_5h_percent']}%, weekly<{cfg['threshold_weekly_percent']}%)"
+        )
+        log(base, msg)
+        if cfg.get("notify", True):
+            notify("Codex accounts low", msg)
+        return 0
+
+    pick = usable[0]
+    if pick.email == active.email:
+        return 0
+
+    # Live-tab safety: switching the global auth.json appears to invalidate
+    # in-flight ChatGPT-backed sessions. Even with per-tab auth.json pinning,
+    # global account churn during live sessions is unsafe. Refuse all global
+    # switches while any tab is alive unless explicitly forced.
+    live = live_tabs(base)
+    if live and os.environ.get("CODEX_PREDICTIVE_FORCE_SWITCH") != "1":
+        pinned = ",".join(sorted({tab.pinned_email for tab in live}))
+        log(
+            base,
+            f"skipping switch {active.email} -> {pick.email}: "
+            f"{len(live)} live tab(s) exist ({pinned}); "
+            f"would rewrite global auth during live sessions"
+        )
+        return 0
+
+    rc, out = switch_default(pick.email, base=base)
+    if rc == 0:
+        log(
+            base,
+            f"switched default {active.email} -> {pick.email} "
+            f"(active remaining 5h={pct(active.remaining_5h_pct)} weekly={pct(active.remaining_weekly_pct)})",
+        )
+        write_state(base)
+        return 0
+    log(base, f"switch failed {active.email} -> {pick.email}: rc={rc} {out[:300]!r}")
+    return rc or 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--once", action="store_true", help="poll once and exit")
+    args = parser.parse_args()
+    base = codex_base()
+    if args.once:
+        return poll_once(base)
+
     while True:
-        config = load_config(home)
-        tick(home)
-        time.sleep(max(5, int(config.get("poll_interval_seconds", 60))))
+        cfg = load_config(base)
+        try:
+            poll_once(base)
+        except Exception as exc:
+            log(base, f"poll error: {exc!r}")
+        time.sleep(max(10, int(cfg.get("poll_interval_seconds", 60))))
 
 
 if __name__ == "__main__":

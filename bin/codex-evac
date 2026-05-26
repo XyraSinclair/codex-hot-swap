@@ -1,0 +1,190 @@
+#!/usr/bin/python3
+"""
+codex-evac: evacuate a live cmux pane off a quota-walled account.
+
+Use this when an existing cmux tab is pinned to an account that just hit the
+ChatGPT-Pro 5h or weekly cap. The script:
+
+  1. Finds the tab's pinned account from <tab_home>/tab.json.
+  2. Finds the freshest rollout JSONL for that tab (so the conversation can
+     be resumed without losing context).
+  3. SIGTERMs the codex child process inside the pane.
+  4. Re-execs `codex resume <rollout>` via the codex-safe wrapper, which
+     will pick a fresh non-walled account via the normal hot-swap path.
+
+The cmux pane stays open; only the codex process inside it gets restarted.
+Conversation context is preserved via the rollout JSONL.
+
+Usage:
+    codex-evac                 # detect current tab from $CODEX_HOME, evac it
+    codex-evac <tab_id>        # evac a specific tab (uuid prefix is ok)
+    codex-evac --all-walled    # evac every live tab pinned to a walled account
+    codex-evac --dry-run       # show what would be done without doing it
+
+Exits 0 on success or no-op, 1 on hard failure.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+
+from codex_hot_swap_lib import (
+    codex_base,
+    latest_rollout_for_tab,
+    live_tabs,
+    quota_walled_emails,
+    read_json,
+    tabs_dir,
+)
+
+
+def banner(msg: str) -> None:
+    sys.stderr.write(f"\n\x1b[1;36m[codex-evac] {msg}\x1b[0m\n")
+    sys.stderr.flush()
+
+
+def find_tab_by_prefix(prefix: str) -> Path | None:
+    if not prefix:
+        return None
+    matches = sorted(tabs_dir().glob(f"{prefix}*"))
+    return matches[0] if matches else None
+
+
+def current_tab_home() -> Path | None:
+    """Best-effort: detect the tab home we're running inside via $CODEX_HOME."""
+    raw = os.environ.get("CODEX_HOME")
+    if not raw:
+        return None
+    home = Path(raw).expanduser().resolve()
+    if home.parent.name != "tabs":
+        return None
+    return home
+
+
+def evac_tab(tab_home: Path, dry_run: bool = False) -> int:
+    tab_meta_path = tab_home / "tab.json"
+    if not tab_meta_path.exists():
+        banner(f"{tab_home.name}: no tab.json, skipping")
+        return 1
+    meta = read_json(tab_meta_path)
+    email = meta.get("pinned_email") or "?"
+    pid = meta.get("pid")
+    banner(f"tab {tab_home.name[:8]} pinned to {email} (codex pid={pid})")
+
+    rollout = latest_rollout_for_tab(tab_home)
+    if rollout is not None:
+        banner(f"will resume rollout: {rollout.name}")
+    else:
+        banner("no rollout found; will start fresh chat (context may be lost)")
+
+    if dry_run:
+        banner(f"dry-run: would SIGTERM pid={pid} and re-exec codex")
+        return 0
+
+    if pid:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            banner(f"sent SIGTERM to codex pid={pid}; waiting for exit")
+            # Give it a moment to exit cleanly
+            for _ in range(30):
+                try:
+                    os.kill(int(pid), 0)
+                    time.sleep(0.1)
+                except ProcessLookupError:
+                    break
+            else:
+                # Still alive — escalate
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                    banner(f"escalated to SIGKILL")
+                except ProcessLookupError:
+                    pass
+        except ProcessLookupError:
+            banner("codex process already gone")
+        except (ValueError, PermissionError) as exc:
+            banner(f"could not signal codex pid={pid}: {exc}")
+            # Continue anyway — maybe the wrapper exits on its own.
+
+    # Re-exec codex via the wrapper. The wrapper will pick a fresh non-walled
+    # account on its own via pick_account / next-pick-hint.
+    cmd = ["codex"]
+    if rollout is not None:
+        # codex resume takes a session id (the uuid in the rollout filename)
+        # OR a path to the rollout JSONL. Path is more reliable.
+        cmd = ["codex", "resume", str(rollout)]
+    else:
+        # Fresh chat — the previous conversation context will be lost.
+        # Append original argv (minus codex itself) so flags carry over.
+        orig_argv = meta.get("argv") or []
+        if orig_argv and orig_argv[0].endswith("codex"):
+            cmd = ["codex"] + list(orig_argv[1:])
+        else:
+            cmd = ["codex"]
+
+    banner(f"re-execing: {' '.join(cmd)}")
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError as exc:
+        banner(f"exec failed: {exc}")
+        return 1
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("tab_id", nargs="?", help="tab id (or prefix); default = detect from $CODEX_HOME")
+    parser.add_argument("--all-walled", action="store_true", help="evac every live tab pinned to a walled account")
+    parser.add_argument("--dry-run", action="store_true", help="show plan only")
+    args = parser.parse_args()
+
+    base = codex_base()
+
+    if args.all_walled:
+        walled = quota_walled_emails(base)
+        if not walled:
+            banner("no accounts are quota-walled; nothing to do")
+            return 0
+        tabs = [t for t in live_tabs(base) if t.pinned_email in walled]
+        if not tabs:
+            banner("no live tabs pinned to walled accounts; nothing to do")
+            return 0
+        # For --all-walled we cannot exec multiple times — we just emit a
+        # plan and instruct the user how to evac one-at-a-time. The exec
+        # path replaces our process, so only the LAST tab can actually be
+        # evacuated from this invocation. Better: print the plan.
+        banner(f"{len(tabs)} live tab(s) pinned to walled accounts:")
+        for tab in tabs:
+            rollout = latest_rollout_for_tab(tab.path)
+            roll_name = rollout.name if rollout else "(no rollout)"
+            sys.stderr.write(
+                f"  tab {tab.tab_id[:8]}  email={tab.pinned_email}  pid={tab.pid}  rollout={roll_name}\n"
+            )
+        sys.stderr.write(
+            "\nTo evac one, run: codex-evac <tab_id>\n"
+            "Or use cmux's per-pane scripting to run `codex-evac` inside each affected pane.\n"
+        )
+        return 0
+
+    tab_home: Path | None = None
+    if args.tab_id:
+        tab_home = find_tab_by_prefix(args.tab_id)
+        if tab_home is None:
+            banner(f"no tab matches prefix {args.tab_id!r}")
+            return 1
+    else:
+        tab_home = current_tab_home()
+        if tab_home is None:
+            banner("CODEX_HOME does not point at a tab dir; pass a tab_id explicitly")
+            return 1
+
+    return evac_tab(tab_home, dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,316 +1,506 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
+"""
+codex-safe: transparent Codex launcher with account hot-swapping.
+
+The wrapper gives each invocation a private CODEX_HOME under
+~/.codex/tabs/<uuid>. auth.json is copied from the selected account vault.
+Immutable/shared config is symlinked back to the real Codex home, but
+thread/session/log state stays tab-local so one account cannot resume another
+account's threads.
+"""
+
 from __future__ import annotations
 
-import argparse
-import contextlib
+import errno
+import fcntl
 import os
 import pty
+import re
 import select
+import shutil
 import signal
+import struct
 import sys
 import termios
 import time
 import tty
-from collections import deque
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-
-from codex_hot_swap_lib import (  # noqa: E402
+from codex_hot_swap_lib import (
+    APIKEY_FALLBACK_EMAIL,  # retained for backwards-compat constants only
+    AccountState,
     account_states,
-    build_transfer_prompt,
     cleanup_tab_home,
-    codex_home,
-    codex_interactive_prompt_supported,
+    codex_base,
     create_tab_home,
-    latest_rollout_from_sqlite,
+    live_tabs,
     load_config,
     mark_broken,
-    output_has_auth_failure,
+    mark_quota_walled,
+    mark_verified_working,
     pick_account,
-    quota_walled_emails,
+    rank_accounts,
+    read_next_pick_hint,
+    record_observed_tokens,
+    reset_broken,
+    switch_default,
     sync_tab_auth_to_vault,
     tab_auth_is_stale_against_vault,
-    write_tab_state,
+    update_tab_pid,
 )
 
-PASS_THROUGH_COMMANDS = {
-    "login",
-    "logout",
-    "mcp",
-    "plugin",
+
+# Codex emits a "tokens used N" trailer at the end of each exec. We use this
+# as our ground-truth observed-usage signal. PTY-stripped form (after ANSI
+# scrubbing) looks like:    tokens used 17,634
+TOKENS_USED_RE = re.compile(rb"tokens used\s+([\d,]+)", re.IGNORECASE)
+
+
+def extract_tokens_used(ring: bytes) -> int | None:
+    """Return the most-recent "tokens used N" count, or None."""
+    matches = TOKENS_USED_RE.findall(ring)
+    if not matches:
+        return None
+    try:
+        return int(matches[-1].replace(b",", b""))
+    except ValueError:
+        return None
+
+CODEX_BIN = shutil.which("codex") or "codex"
+MAX_SWAPS = 3
+MAX_QUOTA_SWAPS = 3
+RING_SIZE = 8192
+TAIL_INSPECT_BYTES = 2048
+
+# Strict-markers-only detection. These are OpenAI/Codex-specific phrases that
+# should appear ONLY when a refresh-token chain has actually been invalidated
+# server-side. Anything more generic ("401 Unauthorized", "Your session has
+# expired", "Please try signing in again") was previously here and matched
+# routine model output — discussing APIs, echoing the user's prompt, etc. —
+# which caused the wrapper to mid-session SIGKILL working sessions and
+# permanently mark healthy accounts broken. Do not put generic strings here.
+AUTH_FAIL_PATTERNS = [
+    rb"refresh token was already used",
+    rb"refresh token was revoked",
+    rb"Your access token could not be refreshed",
+    rb"authentication token has been invalidated",
+    rb"token_revoked",
+]
+
+# Quota wall detection. The earlier policy refused all text-based quota
+# detection on the theory that words like "quota" / "rate limit" appear in
+# normal output. That's true for generic words. But Codex's specific hard-cap
+# message is uniquely identifying — it includes the user-facing URL
+# https://chatgpt.com/codex/settings/usage and the literal phrase "You've hit
+# your usage limit". Model output discussing rate limits will not contain that
+# exact URL. The predictive daemon's usage-API readings can lie or lag (we
+# proved gmail showing 0% used while actually walled), so the wrapper needs
+# the ground-truth signal from codex's own exit message.
+QUOTA_FAIL_PATTERNS: list[bytes] = [
+    # ChatGPT-Pro hard cap
+    rb"You've hit your usage limit\. Visit https://chatgpt\.com/codex/settings/usage",
+    rb"hit your usage limit\..*?settings/usage",
+    # API-key billing quota exceeded (apikey fallback path). The full message
+    # is "Quota exceeded. Check your plan and billing details." The phrase is
+    # specific enough that model output won't accidentally match it.
+    rb"Quota exceeded\. Check your plan and billing details",
+]
+# Capture the "try again at <date time>" tail to know when the wall expires.
+QUOTA_RESET_RE = re.compile(
+    rb"try again at\s+([A-Za-z]+ \d+(?:st|nd|rd|th)?,\s*\d{4}\s+\d{1,2}:\d{2}\s*(?:AM|PM))",
+    re.IGNORECASE,
+)
+
+COMPILED_AUTH = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in AUTH_FAIL_PATTERNS]
+COMPILED_QUOTA = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in QUOTA_FAIL_PATTERNS]
+ANSI_RE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*[\x07\x1b]")
+DETECTION_DISABLED = os.environ.get("CODEX_SAFE_NO_KILL") == "1"
+
+PASSTHROUGH_SUBCOMMANDS = {
     "mcp-server",
     "app-server",
-    "remote-control",
     "app",
     "completion",
     "update",
-    "doctor",
-    "sandbox",
-    "debug",
-    "apply",
-    "resume",
-    "fork",
-    "cloud",
-    "exec",
-    "review",
+    "login",
+    "logout",
 }
 
 
-def first_command(argv: list[str]) -> str | None:
-    for item in argv:
-        if item == "--":
-            return None
-        if item.startswith("-"):
+def banner(msg: str) -> None:
+    sys.stderr.write(f"\n\x1b[1;33m[codex-safe] {msg}\x1b[0m\n")
+    sys.stderr.flush()
+
+
+def passthrough_exec(argv: list[str]) -> None:
+    os.execvp(argv[0], argv)
+
+
+def detect_first_subcommand(argv: list[str]) -> str | None:
+    for arg in argv[1:]:
+        if arg.startswith("-"):
             continue
-        return item
+        return arg
     return None
 
 
-def exec_codex(argv: list[str], env: dict[str, str]) -> None:
-    os.execvpe("codex", ["codex", *argv], env)
+def forward_winch(master_fd: int) -> None:
+    try:
+        s = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\x00" * 8)
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, s)
+    except OSError:
+        pass
 
 
-def print_banner(message: str) -> None:
-    os.write(1, f"\n[codex-hot-swap] {message}\n".encode())
+def classify_failure(ring: bytes) -> str | None:
+    if DETECTION_DISABLED:
+        return None
+    # Inspect only the tail. The fatal "your refresh token was already used"
+    # message only ever appears at the very end of a session, right before
+    # codex exits. Anything earlier in the ring is unrelated chatter.
+    tail = ring[-TAIL_INSPECT_BYTES:] if len(ring) > TAIL_INSPECT_BYTES else ring
+    if any(p.search(tail) for p in COMPILED_AUTH):
+        return "auth"
+    if COMPILED_QUOTA and any(p.search(tail) for p in COMPILED_QUOTA):
+        return "quota"
+    return None
 
 
-def terminate_child(pid: int) -> None:
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGTERM)
-    deadline = time.time() + 4
-    while time.time() < deadline:
-        try:
-            done, _status = os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            return
-        if done:
-            return
-        time.sleep(0.1)
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGKILL)
-    with contextlib.suppress(ChildProcessError):
-        os.waitpid(pid, 0)
+def _classify_quota_only(ring: bytes) -> str | None:
+    """Conservative quota-only classifier, used on rc=0.
+
+    Codex prints "You've hit your usage limit. Visit https://chatgpt.com/codex
+    /settings/usage to ... try again at <time>." and then exits with rc=0. We
+    must catch this even on clean exits so the wrapper can mark the account
+    walled and the user knows to wait. Only the unique URL+phrase fingerprint
+    qualifies — generic strings remain off-limits.
+    """
+    if DETECTION_DISABLED:
+        return None
+    if not COMPILED_QUOTA:
+        return None
+    tail = ring[-TAIL_INSPECT_BYTES:] if len(ring) > TAIL_INSPECT_BYTES else ring
+    if any(p.search(tail) for p in COMPILED_QUOTA):
+        return "quota"
+    return None
 
 
-def migration_reason_for(email: str, home: Path, config: dict) -> str | None:
-    lowered = email.lower()
-    if lowered in quota_walled_emails(home, config):
-        return "quota-walled"
-
-    threshold_5h = float(config.get("live_migrate_below_5h_percent", 0) or 0)
-    threshold_weekly = float(config.get("live_migrate_below_weekly_percent", 0) or 0)
-    if threshold_5h <= 0 and threshold_weekly <= 0:
+def extract_quota_reset(ring: bytes) -> str | None:
+    """Pull the "try again at <date time>" tail from a quota-walled session."""
+    tail = ring[-TAIL_INSPECT_BYTES:] if len(ring) > TAIL_INSPECT_BYTES else ring
+    m = QUOTA_RESET_RE.search(tail)
+    if not m:
+        return None
+    try:
+        return m.group(1).decode("utf-8", errors="replace")
+    except Exception:
         return None
 
-    for state in account_states(home, config):
-        if state.email.lower() != lowered:
-            continue
-        if threshold_5h > 0 and state.remaining_5h is not None and state.remaining_5h <= threshold_5h:
-            return f"5h quota at {state.remaining_5h:.0f}%"
-        if (
-            threshold_weekly > 0
-            and state.remaining_weekly is not None
-            and state.remaining_weekly <= threshold_weekly
-        ):
-            return f"weekly quota at {state.remaining_weekly:.0f}%"
-    return None
 
+def run_with_pty(argv: list[str], env: dict[str, str], tab_home: Path) -> tuple[int, str | None, bytes]:
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        os.execvpe(argv[0], argv, env)
 
-def run_interactive(argv: list[str], excluded: set[str] | None = None) -> int:
-    home = codex_home()
-    config = load_config(home)
-    excluded = {item.lower() for item in (excluded or set())}
-    migrations = 0
-    prompt_override: str | None = None
-    interactive_prompt_support: bool | None = None
+    update_tab_pid(tab_home, pid)
+    forward_winch(master_fd)
+    sigwinch_handler = lambda *_: forward_winch(master_fd)
+    old_winch = signal.signal(signal.SIGWINCH, sigwinch_handler)
 
-    while True:
-        states = account_states(home, config)
-        walled = quota_walled_emails(home, config)
-        account = pick_account(states, config, excluded=excluded, walled=walled)
-        if account is None:
-            print_banner("no usable account is available; leaving control with the shell")
-            return 75
+    stdin_is_tty = sys.stdin.isatty()
+    if stdin_is_tty:
+        old_termios = termios.tcgetattr(0)
+        tty.setraw(0)
+    else:
+        old_termios = None
 
-        tab_id, tab_home = create_tab_home(home, account)
-        child_argv = list(argv)
-        if prompt_override:
-            if interactive_prompt_support is None:
-                interactive_prompt_support = codex_interactive_prompt_supported(dict(os.environ))
-            if not interactive_prompt_support:
-                print_banner(
-                    "installed Codex CLI does not advertise interactive initial-prompt support; "
-                    "cannot safely migrate without using codex exec"
-                )
-                cleanup_tab_home(tab_home)
-                return 78
-            child_argv.append(prompt_override)
+    ring = b""
+    failure: str | None = None
+    # Periodic auth sync: if the chat is long-running and codex refreshes the
+    # RT mid-session, we want that fresh RT pushed back to the vault file
+    # promptly so a sibling tab spawning a minute later doesn't grab the
+    # already-rotated old RT and trigger refresh_token_reused. Cheap: the
+    # function returns False fast when no refresh has happened yet.
+    last_sync_at = time.monotonic()
+    SYNC_INTERVAL_SECONDS = 30.0
+    try:
+        pinned_email = None
+        try:
+            import json as _j
+            with (tab_home / "tab.json").open() as _fh:
+                pinned_email = _j.load(_fh).get("pinned_email")
+        except Exception:
+            pinned_email = None
+    except Exception:
+        pinned_email = None
 
-        env = dict(os.environ)
-        env["CODEX_HOME"] = str(tab_home)
-        env["CODEX_HOTSWAP_TAB_ID"] = tab_id
-        env["CODEX_HOTSWAP_PINNED_EMAIL"] = account.email
+    try:
+        while True:
+            try:
+                rlist, _, _ = select.select([0, master_fd], [], [], 0.5)
+            except (InterruptedError, OSError) as e:
+                if e.args and e.args[0] == errno.EINTR:
+                    continue
+                break
 
-        pid, master_fd = pty.fork()
-        if pid == 0:
-            exec_codex(child_argv, env)
+            # Periodic vault sync. Runs at most once per SYNC_INTERVAL_SECONDS
+            # and uses sync_tab_auth_to_vault's marker-comparison shortcut to
+            # bail when nothing has changed. Cheap when idle, important when
+            # codex just rotated tokens.
+            if (
+                pinned_email
+                and pinned_email not in {APIKEY_FALLBACK_EMAIL, None}
+                and (time.monotonic() - last_sync_at) >= SYNC_INTERVAL_SECONDS
+            ):
+                try:
+                    sync_tab_auth_to_vault(tab_home, pinned_email)
+                except Exception:
+                    pass
+                last_sync_at = time.monotonic()
 
-        write_tab_state(
-            tab_home,
-            tab_id=tab_id,
-            account=account,
-            argv=child_argv,
-            wrapper_pid=os.getpid(),
-            child_pid=pid,
-            status="running",
-            migrations=migrations,
-        )
+            if 0 in rlist:
+                try:
+                    data = os.read(0, 4096)
+                except OSError:
+                    data = b""
+                if data:
+                    try:
+                        os.write(master_fd, data)
+                    except OSError:
+                        break
 
-        old_term = None
-        if sys.stdin.isatty():
-            old_term = termios.tcgetattr(sys.stdin.fileno())
-            tty.setraw(sys.stdin.fileno())
+            if master_fd in rlist:
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError:
+                    data = b""
+                if not data:
+                    break
+                try:
+                    os.write(1, data)
+                except OSError:
+                    pass
+                ring = (ring + ANSI_RE.sub(b"", data))[-RING_SIZE:]
+                # Mid-stream quota-wall detection. The historical false-positive
+                # nightmare came from generic substrings like "quota" / "rate
+                # limit" matching model output. The current quota fingerprint
+                # is the EXACT codex CLI message including the user-facing URL
+                # https://chatgpt.com/codex/settings/usage — model output won't
+                # contain that URL. Mid-stream detection lets us kill+repick
+                # within ~100ms of the wall appearing, instead of waiting for
+                # codex to fully exit (interactive sessions never exit on
+                # their own after a quota wall — codex just sits idle).
+                if (
+                    not DETECTION_DISABLED
+                    and COMPILED_QUOTA
+                    and any(p.search(ring[-TAIL_INSPECT_BYTES:]) for p in COMPILED_QUOTA)
+                ):
+                    # Kill codex and signal quota failure. Drain a tiny bit so
+                    # the user sees the wall message scrolled, then return.
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        os.waitpid(pid, 0)
+                    except ChildProcessError:
+                        pass
+                    return (0, "quota", ring)
 
-        ring: deque[str] = deque(maxlen=200)
-        last_output = time.time()
-        last_wall_poll = 0.0
-        should_migrate = False
-        exit_code: int | None = None
+            try:
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+                if wpid == pid:
+                    try:
+                        while True:
+                            data = os.read(master_fd, 4096)
+                            if not data:
+                                break
+                            os.write(1, data)
+                            ring = (ring + ANSI_RE.sub(b"", data))[-RING_SIZE:]
+                    except OSError:
+                        pass
+                    rc = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+                    # Auth-chain failures only matter on nonzero exit (codex
+                    # crashes out on bad refresh tokens). Quota walls, however,
+                    # are printed and codex exits CLEANLY (rc=0) — so we must
+                    # also inspect the ring on clean exits, but ONLY for the
+                    # tight quota-wall fingerprint. Anything more permissive
+                    # would re-introduce the false-positive nightmare that
+                    # caused the original mid-stream-kill bug.
+                    failure = classify_failure(ring) if rc != 0 else _classify_quota_only(ring)
+                    return (rc, failure, ring)
+            except ChildProcessError:
+                break
 
         try:
-            while True:
-                ready, _, _ = select.select([master_fd, sys.stdin.fileno()], [], [], 0.25)
-                if master_fd in ready:
-                    try:
-                        data = os.read(master_fd, 4096)
-                    except OSError:
-                        data = b""
-                    if data:
-                        last_output = time.time()
-                        with contextlib.suppress(OSError):
-                            os.write(sys.stdout.fileno(), data)
-                        ring.append(data.decode(errors="replace"))
-                    else:
-                        break
-                if sys.stdin.fileno() in ready:
-                    data = os.read(sys.stdin.fileno(), 4096)
-                    if data:
-                        with contextlib.suppress(OSError):
-                            os.write(master_fd, data)
-
-                try:
-                    done, status = os.waitpid(pid, os.WNOHANG)
-                except ChildProcessError:
-                    done, status = pid, 0
-                if done:
-                    if os.WIFEXITED(status):
-                        exit_code = os.WEXITSTATUS(status)
-                    elif os.WIFSIGNALED(status):
-                        exit_code = 128 + os.WTERMSIG(status)
-                    else:
-                        exit_code = 1
-                    break
-
-                if os.environ.get("CODEX_SAFE_NO_AUTO_QUOTA_MIGRATE"):
-                    continue
-                clock = time.time()
-                if clock - last_wall_poll < 2:
-                    continue
-                last_wall_poll = clock
-                config = load_config(home)
-                if migrations >= int(config.get("max_live_migrations_per_tab", 4)):
-                    continue
-                idle_seconds = float(config.get("live_migrate_idle_seconds", 2))
-                if clock - last_output < idle_seconds:
-                    continue
-                reason = migration_reason_for(account.email, home, config)
-                if reason:
-                    should_migrate = True
-                    print_banner(f"{account.email} is {reason}; migrating this tab")
-                    terminate_child(pid)
-                    exit_code = 75
-                    break
-        finally:
-            if old_term is not None:
-                with contextlib.suppress(termios.error):
-                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_term)
-            with contextlib.suppress(OSError):
-                os.close(master_fd)
-
-        if exit_code is None:
+            _, status = os.waitpid(pid, 0)
+            rc = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+            failure = classify_failure(ring) if rc != 0 else _classify_quota_only(ring)
+            return (rc, failure, ring)
+        except ChildProcessError:
+            return (1, None, ring)
+    finally:
+        if old_termios is not None:
             try:
-                _done, status = os.waitpid(pid, 0)
-                if os.WIFEXITED(status):
-                    exit_code = os.WEXITSTATUS(status)
-                elif os.WIFSIGNALED(status):
-                    exit_code = 128 + os.WTERMSIG(status)
-                else:
-                    exit_code = 1
-            except ChildProcessError:
-                exit_code = 0 if not should_migrate else 75
+                termios.tcsetattr(0, termios.TCSANOW, old_termios)
+            except termios.error:
+                pass
+        signal.signal(signal.SIGWINCH, old_winch)
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
 
-        write_tab_state(
-            tab_home,
-            tab_id=tab_id,
-            account=account,
-            argv=child_argv,
-            wrapper_pid=os.getpid(),
-            child_pid=None,
-            status="migrating" if should_migrate else "exited",
-            migrations=migrations,
+
+def maybe_switch_default(email: str, base: Path) -> None:
+    live = live_tabs(base)
+    if live and os.environ.get("CODEX_SAFE_FORCE_SWITCH") != "1":
+        banner(
+            f"not switching global default to {email}: "
+            f"{len(live)} live tab(s) still exist"
         )
+        return
+    rc, out = switch_default(email, base=base)
+    if rc != 0:
+        banner(f"could not switch default account to {email}: {out[:240]}")
 
-        with contextlib.suppress(Exception):
-            sync_tab_auth_to_vault(tab_home, account)
 
-        output = "".join(ring)
-        if should_migrate:
-            excluded.add(account.email.lower())
-            rollout = latest_rollout_from_sqlite(tab_home)
-            prompt_override = (
-                build_transfer_prompt(rollout)
-                if rollout is not None
-                else "This Codex chat was automatically migrated after a quota wall. No rollout could be reconstructed; ask the user one concise question if needed."
+def main() -> None:
+    argv = list(sys.argv)
+    argv[0] = CODEX_BIN
+
+    sub = detect_first_subcommand(argv)
+    if sub in PASSTHROUGH_SUBCOMMANDS:
+        passthrough_exec(argv)
+        return
+
+    base = codex_base()
+    cfg = load_config(base)
+    auth_swaps = 0
+    quota_swaps = 0
+    excluded: set[str] = set()
+
+    while True:
+        account = None
+        # Ultra-fast cold-start: read the daemon's pre-computed next-pick hint
+        # first. Skips full ranker rebuild (~3-30ms savings) and keeps the
+        # wrapper's pre-codex overhead in the single-digit-ms range.
+        if not excluded:
+            hint_email = read_next_pick_hint(base)
+            if hint_email:
+                for s in account_states(base):
+                    if s.email == hint_email and s.vault_path is not None and not s.broken:
+                        account = s
+                        break
+        if account is None:
+            account = pick_account(base, exclude_emails=excluded, config=cfg)
+        if account is None:
+            banner(
+                "no usable Codex account vault is available. "
+                "Run `codex-status`; if every chain is broken, run `codex-recover --reauth`."
             )
-            migrations += 1
-            cleanup_tab_home(tab_home)
-            continue
+            sys.exit(2)
 
-        if exit_code != 0 and output_has_auth_failure(output):
-            if tab_auth_is_stale_against_vault(tab_home, account):
-                print_banner(f"{account.email} tab auth was stale; retrying with fresh vault")
+        tab_home = create_tab_home(account, argv, base)
+        child_env = os.environ.copy()
+        child_env["CODEX_HOME"] = str(tab_home)
+        child_env["CODEX_GLOBAL_HOME"] = str(base)
+        child_env["CODEX_PINNED_EMAIL"] = account.email
+
+        if os.environ.get("CODEX_SAFE_VERBOSE") == "1":
+            banner(f"pinned this tab to {account.email}")
+
+        rc, failure, ring = run_with_pty(argv, child_env, tab_home)
+
+        stale_tab_auth = False
+        if failure == "auth":
+            stale_tab_auth = tab_auth_is_stale_against_vault(tab_home, account.email, base)
+
+        if failure is None:
+            try:
+                sync_tab_auth_to_vault(tab_home, account.email, base)
+                # A clean Codex session is the strongest possible proof that
+                # this account works. Clear any stale "broken" flag so the
+                # account can never get permanently stuck in the trap-door,
+                # and stamp the verified-working ledger so the next pick
+                # short-circuits past the (possibly lying) usage API.
+                if rc == 0:
+                    try:
+                        reset_broken(account.email, base)
+                    except Exception:
+                        pass
+                    try:
+                        mark_verified_working(account.email, base)
+                    except Exception:
+                        pass
+                    # Record observed tokens for the predictive headroom
+                    # calculation. This is ground truth from codex itself,
+                    # not the lying usage API.
+                    try:
+                        tk = extract_tokens_used(ring)
+                        if tk:
+                            record_observed_tokens(account.email, tk, base)
+                    except Exception:
+                        pass
+            finally:
+                cleanup_tab_home(tab_home)
+            sys.exit(rc)
+
+        cleanup_tab_home(tab_home)
+        excluded.add(account.email)
+
+        if failure == "auth":
+            if not stale_tab_auth:
+                mark_broken(account.email, base)
+            if auth_swaps >= MAX_SWAPS:
+                banner(
+                    f"hit auth wall after {auth_swaps} swap attempts. "
+                    "All known accounts may have broken refresh-token chains. "
+                    "Run `codex-recover --reauth` to re-OAuth one."
+                )
+                sys.exit(rc)
+            auth_swaps += 1
+            if stale_tab_auth:
+                banner(
+                    f"detected auth failure on a stale tab snapshot for {account.email} "
+                    f"(contention swap {auth_swaps}/{MAX_SWAPS}); repicking without marking account broken..."
+                )
             else:
-                print_banner(f"{account.email} auth chain appears broken; excluding it")
-                mark_broken(home, account.email)
-            excluded.add(account.email.lower())
-            migrations += 1
-            cleanup_tab_home(tab_home)
-            continue
+                banner(
+                    f"detected auth-chain failure on {account.email} "
+                    f"(swap {auth_swaps}/{MAX_SWAPS}); repicking account..."
+                )
+        elif failure == "quota":
+            reset_text = extract_quota_reset(ring)
+            try:
+                mark_quota_walled(account.email, reset_text, base)
+            except Exception as exc:
+                banner(f"could not persist quota wall for {account.email}: {exc}")
+            if quota_swaps >= MAX_QUOTA_SWAPS:
+                banner(
+                    f"hit quota wall after {quota_swaps} quota swaps. "
+                    "All usable accounts may be quota-walled."
+                )
+                sys.exit(rc)
+            quota_swaps += 1
+            reset_note = f" until {reset_text}" if reset_text else ""
+            banner(
+                f"detected quota wall on {account.email}{reset_note} "
+                f"(quota swap {quota_swaps}/{MAX_QUOTA_SWAPS}); repicking account..."
+            )
+        else:
+            sys.exit(rc)
 
-        if exit_code == 0:
-            cleanup_tab_home(tab_home)
-        return exit_code
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--hotswap-help", action="store_true")
-    known, remainder = parser.parse_known_args()
-    if known.hotswap_help or remainder in (["--help"], ["-h"]):
-        print("Usage: codex-safe [codex options] [prompt]")
-        print("Passes management subcommands through to codex.")
-        print("Set CODEX_SAFE_DISABLE=1 to bypass the wrapper.")
-        print("Set CODEX_SAFE_NO_AUTO_QUOTA_MIGRATE=1 to disable live migration.")
-        return 0
-
-    argv = remainder
-    command = first_command(argv)
-    if os.environ.get("CODEX_SAFE_DISABLE") or command in PASS_THROUGH_COMMANDS:
-        exec_codex(argv, dict(os.environ))
-    return run_interactive(argv)
+        next_account = pick_account(base, exclude_emails=excluded, config=cfg)
+        if next_account is None:
+            banner("no alternate account is currently usable; stopping automatic relaunch.")
+            sys.exit(rc)
+        maybe_switch_default(next_account.email, base)
+        banner(f"relaunching codex pinned to {next_account.email}...")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

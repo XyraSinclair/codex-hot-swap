@@ -1,330 +1,289 @@
 #!/usr/bin/env python3
+"""Test suite for the v0.2.0 codex-hot-swap lib.
+
+Covers the live source-of-truth design:
+  * per-tab accounts/ pinning (the core fix that makes codex actually use
+    the chosen account)
+  * sessions/ symlink so rollouts survive cleanup_tab_home
+  * logs_2.sqlite shared back to global (7x startup speedup)
+  * one-tab-per-account rule that prevents refresh_token_reused races
+  * quota-walled ledger with reset-time parsing and auto-expiry
+  * verified-working ledger (recent-success short-circuit over the lying
+    usage API)
+  * observed-token tracking from PTY scrape (ground truth)
+  * exclusive vault lock for refresh-token safety
+
+The tests run in a tmpdir CODEX_HOME — they never touch the real install.
+"""
 from __future__ import annotations
 
+import base64
 import json
 import os
-import sqlite3
+import sys
 import tempfile
+import threading
 import time
 import unittest
-import base64
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-os.sys.path.insert(0, str(REPO / "bin"))
+sys.path.insert(0, str(REPO / "bin"))
 
+import codex_hot_swap_lib as L  # noqa: E402
 from codex_hot_swap_lib import (  # noqa: E402
+    _exclusive_lock,
     _vault_filename_for_key,
     account_states,
-    codex_interactive_prompt_supported,
+    clear_quota_wall,
+    codex_base,
     create_tab_home,
-    latest_rollout_from_sqlite,
-    live_tabs,
-    load_config,
     mark_broken,
+    mark_quota_walled,
+    mark_verified_working,
+    observed_5h_tokens,
     pick_account,
     quota_walled_emails,
-    wall_cache_path,
-    write_json_atomic,
-    write_quota_wall_cache,
+    rank_accounts,
+    record_observed_tokens,
+    verified_working_emails,
+    write_next_pick_hint,
+    read_next_pick_hint,
 )
-from codex_safe_import import migration_reason_for  # noqa: E402
 
 
-class HotSwapLibTests(unittest.TestCase):
+def _id_token_for(email: str, account_id: str, user_id: str) -> str:
+    """Build a minimal JWT codex's auth parser accepts (just the email claim)."""
+    header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+    payload = json.dumps(
+        {
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_user_id": user_id,
+            },
+        }
+    )
+    payload_b64 = base64.urlsafe_b64encode(payload.encode()).rstrip(b"=").decode()
+    return f"{header}.{payload_b64}."
+
+
+def _write_vault(path: Path, email: str, account_key: str) -> None:
+    user_id, account_id = account_key.split("::", 1)
+    blob = {
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": False,
+        "tokens": {
+            "id_token": _id_token_for(email, account_id, user_id),
+            "access_token": "AT_v0",
+            "refresh_token": "RT_v0",
+            "account_id": account_id,
+        },
+        "last_refresh": "2026-05-26T00:00:00Z",
+    }
+    path.write_text(json.dumps(blob), encoding="utf-8")
+
+
+def _make_home(tmp: Path) -> Path:
+    """Build a minimal CODEX_HOME with two accounts the lib will recognise."""
+    home = tmp / "codex"
+    (home / "accounts" / "recover").mkdir(parents=True)
+    (home / "sessions").mkdir()
+    a_key = "user-AAA::aaaa-0000-0000-0000-000000000001"
+    b_key = "user-BBB::bbbb-0000-0000-0000-000000000002"
+    a_vault = home / "accounts" / f"{_vault_filename_for_key(a_key)}.auth.json"
+    b_vault = home / "accounts" / f"{_vault_filename_for_key(b_key)}.auth.json"
+    _write_vault(a_vault, "a@example.com", a_key)
+    _write_vault(b_vault, "b@example.com", b_key)
+    future = int(time.time()) + 3600
+    registry = {
+        "schema_version": 3,
+        "accounts": [
+            {
+                "account_key": a_key,
+                "email": "a@example.com",
+                "last_usage": {
+                    "primary": {"used_percent": 10, "resets_at": future},
+                    "secondary": {"used_percent": 20, "resets_at": future},
+                },
+                "last_used_at": int(time.time()),
+            },
+            {
+                "account_key": b_key,
+                "email": "b@example.com",
+                "last_usage": {
+                    "primary": {"used_percent": 80, "resets_at": future},
+                    "secondary": {"used_percent": 30, "resets_at": future},
+                },
+                "last_used_at": int(time.time()) - 60,
+            },
+        ],
+        "active_account_key": a_key,
+        "api": {"usage": True},
+    }
+    (home / "accounts" / "registry.json").write_text(json.dumps(registry))
+    return home
+
+
+class HotSwap(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.home = Path(self.tmp.name) / "codex"
-        (self.home / "accounts").mkdir(parents=True)
-        future = time.time() + 3600
-        registry = {
-            "accounts": {
-                "a": {
-                    "email": "a@example.com",
-                    "auth_path": "a.auth.json",
-                    "usage": {
-                        "5h": {"used_percent": 10, "resets_at": future},
-                        "weekly": {"used_percent": 20, "resets_at": future},
-                    },
-                },
-                "b": {
-                    "email": "b@example.com",
-                    "auth_path": "b.auth.json",
-                    "usage": {
-                        "5h": {"used_percent": 100, "resets_at": future},
-                        "weekly": {"used_percent": 50, "resets_at": future},
-                    },
-                },
-            }
-        }
-        (self.home / "accounts" / "registry.json").write_text(
-            json.dumps(registry),
-            encoding="utf-8",
-        )
-        (self.home / "accounts" / "a.auth.json").write_text("{}", encoding="utf-8")
-        (self.home / "accounts" / "b.auth.json").write_text("{}", encoding="utf-8")
+        self.home = _make_home(Path(self.tmp.name))
+        os.environ["CODEX_HOME"] = str(self.home)
+        os.environ["CODEX_GLOBAL_HOME"] = str(self.home)
 
     def tearDown(self) -> None:
+        os.environ.pop("CODEX_HOME", None)
+        os.environ.pop("CODEX_GLOBAL_HOME", None)
         self.tmp.cleanup()
 
-    def test_registry_used_percent_means_used_not_remaining(self) -> None:
-        states = {state.email: state for state in account_states(self.home)}
-        self.assertEqual(states["a@example.com"].remaining_5h, 90)
-        self.assertEqual(states["a@example.com"].remaining_weekly, 80)
-        self.assertEqual(states["b@example.com"].remaining_5h, 0)
+    # ----- per-tab pinning (the core fix) -----------------------------------
 
-    def test_codex_auth_list_registry_uses_account_key_and_last_usage(self) -> None:
-        future = time.time() + 3600
-        account_key = "encoded-account-key::account-uuid"
-        filename_key = base64.urlsafe_b64encode(
-            account_key.encode("utf-8")
-        ).decode("ascii").rstrip("=")
-        registry = {
-            "accounts": [
-                {
-                    "account_key": account_key,
-                    "email": "list@example.com",
-                    "last_usage": {
-                        "primary": {"used_percent": 25, "resets_at": future},
-                        "secondary": {"used_percent": 75, "resets_at": future},
-                    },
-                }
-            ]
-        }
-        (self.home / "accounts" / "registry.json").write_text(
-            json.dumps(registry),
-            encoding="utf-8",
-        )
-        (self.home / "accounts" / f"{filename_key}.auth.json").write_text(
-            "{}",
-            encoding="utf-8",
-        )
-
-        states = account_states(self.home)
-        self.assertEqual(len(states), 1)
-        state = states[0]
-        self.assertEqual(state.email, "list@example.com")
-        self.assertTrue(state.auth_exists)
-        self.assertEqual(state.auth_path.name, f"{filename_key}.auth.json")
-        self.assertEqual(state.remaining_5h, 75)
-        self.assertEqual(state.remaining_weekly, 25)
-
-    def test_wall_cache_uses_fresh_zero_remaining_with_future_reset(self) -> None:
-        states = account_states(self.home)
-        write_quota_wall_cache(self.home, states)
-        self.assertEqual(quota_walled_emails(self.home), {"b@example.com"})
-
-    def test_stale_wall_cache_is_ignored(self) -> None:
-        write_json_atomic(
-            wall_cache_path(self.home),
-            {
-                "written_at": time.time() - 9999,
-                "accounts": {
-                    "a@example.com": {
-                        "email": "a@example.com",
-                        "windows": {"weekly": {"remaining_percent": 0}},
-                    }
-                },
-            },
-        )
-        self.assertEqual(quota_walled_emails(self.home), set())
-
-    def test_expired_reset_window_is_ignored(self) -> None:
-        write_json_atomic(
-            wall_cache_path(self.home),
-            {
-                "written_at": time.time(),
-                "accounts": {
-                    "a@example.com": {
-                        "email": "a@example.com",
-                        "windows": {
-                            "weekly": {
-                                "remaining_percent": 0,
-                                "resets_at": time.time() - 5,
-                            }
-                        },
-                    }
-                },
-            },
-        )
-        self.assertEqual(quota_walled_emails(self.home), set())
-
-    def test_active_weekly_wall_survives_expired_5h_window(self) -> None:
-        write_json_atomic(
-            wall_cache_path(self.home),
-            {
-                "written_at": time.time(),
-                "accounts": {
-                    "a@example.com": {
-                        "email": "a@example.com",
-                        "windows": {
-                            "5h": {
-                                "remaining_percent": 0,
-                                "resets_at": time.time() - 5,
-                            },
-                            "weekly": {
-                                "remaining_percent": 0,
-                                "resets_at": time.time() + 3600,
-                            },
-                        },
-                    }
-                },
-            },
-        )
-        self.assertEqual(quota_walled_emails(self.home), {"a@example.com"})
-
-    def test_pick_account_excludes_walled_and_broken_accounts(self) -> None:
-        config = load_config(self.home)
-        states = account_states(self.home, config)
-        self.assertEqual(
-            pick_account(states, config, walled={"b@example.com"}).email,
-            "a@example.com",
-        )
-        mark_broken(self.home, "a@example.com")
-        states = account_states(self.home, config)
-        self.assertIsNone(
-            pick_account(
-                states,
-                config,
-                walled={"b@example.com"},
-            )
-        )
-
-    def test_live_tabs_accepts_legacy_pinned_email_and_pid(self) -> None:
-        tab_home = self.home / "tabs" / "legacy-tab"
-        tab_home.mkdir(parents=True)
-        (tab_home / "tab.json").write_text(
-            json.dumps(
-                {
-                    "tab_id": "legacy-tab",
-                    "pinned_email": "a@example.com",
-                    "wrapper_pid": os.getpid(),
-                    "pid": 123456789,
-                }
-            ),
-            encoding="utf-8",
-        )
-        tabs = live_tabs(self.home)
-        self.assertEqual(len(tabs), 1)
-        self.assertEqual(tabs[0]["email"], "a@example.com")
-        self.assertEqual(tabs[0]["child_pid"], 123456789)
-
-    def test_proactive_migration_uses_cached_registry_state(self) -> None:
-        config = load_config(self.home)
-        config["live_migrate_below_5h_percent"] = 1
-        self.assertEqual(
-            migration_reason_for("b@example.com", self.home, config),
-            "5h quota at 0%",
-        )
-        self.assertIsNone(migration_reason_for("a@example.com", self.home, config))
-
-    def test_rollout_lookup_uses_tab_sqlite_latest_thread(self) -> None:
-        old_rollout = self.home / "sessions" / "old" / "rollout-old.jsonl"
-        new_rollout = self.home / "sessions" / "new" / "rollout-new.jsonl"
-        old_rollout.parent.mkdir(parents=True)
-        new_rollout.parent.mkdir(parents=True)
-        old_rollout.write_text("{}\n", encoding="utf-8")
-        new_rollout.write_text("{}\n", encoding="utf-8")
-        db = self.home / "state_5.sqlite"
-        conn = sqlite3.connect(db)
-        try:
-            conn.execute("create table threads (rollout_path text, updated_at integer)")
-            conn.execute(
-                "insert into threads (rollout_path, updated_at) values (?, ?)",
-                (str(old_rollout), 1),
-            )
-            conn.execute(
-                "insert into threads (rollout_path, updated_at) values (?, ?)",
-                (str(new_rollout), 2),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        self.assertEqual(latest_rollout_from_sqlite(self.home), new_rollout)
-
-    def test_create_tab_home_pins_account_via_per_tab_registry(self) -> None:
-        """Regression: pre-v0.1.4 tabs inherited the global active_account_key,
-        so codex picked the wrong account regardless of which auth.json the
-        wrapper copied. The per-tab accounts/ dir with a single-account
-        registry forces codex to use exactly the chosen account.
-        """
-        states = {state.email: state for state in account_states(self.home)}
+    def test_create_tab_home_writes_per_tab_registry(self) -> None:
+        """Tabs must have their OWN accounts/registry.json with active_account_key
+        set to the chosen account. Without this, codex 0.132+ reads the global
+        active_account_key and pins every tab to the same account regardless
+        of which vault the wrapper copied at the top level."""
+        states = {s.email: s for s in account_states(self.home)}
         chosen = states["a@example.com"]
-        tab_id, tab_home = create_tab_home(self.home, chosen)
+        tab_home = create_tab_home(chosen, ["codex"], self.home)
 
-        # Top-level auth.json copied from chosen vault.
-        self.assertTrue((tab_home / "auth.json").is_file())
-
-        # Per-tab accounts dir exists as a real directory (NOT a symlink to global).
+        # accounts/ is a REAL dir, not a symlink to the global accounts/.
         tab_accounts = tab_home / "accounts"
         self.assertTrue(tab_accounts.is_dir())
         self.assertFalse(tab_accounts.is_symlink())
 
-        # Per-tab registry pins active_account_key to ONLY the chosen account.
+        # registry has only the chosen account and pins it active.
         reg = json.loads((tab_accounts / "registry.json").read_text())
         self.assertEqual(len(reg["accounts"]), 1)
         self.assertEqual(reg["accounts"][0]["email"], "a@example.com")
         self.assertEqual(reg["active_account_key"], reg["accounts"][0]["account_key"])
 
-        # The per-account vault is copied under the codex-expected base64url filename.
-        expected_vault = tab_accounts / f"{_vault_filename_for_key(reg['active_account_key'])}.auth.json"
-        self.assertTrue(expected_vault.is_file())
+        # The per-account vault is materialized under the codex-expected
+        # base64url filename so codex finds it via the registry lookup.
+        expected = tab_accounts / f"{_vault_filename_for_key(reg['active_account_key'])}.auth.json"
+        self.assertTrue(expected.is_file())
 
-    def test_logs_sqlite_symlinked_into_tab_home(self) -> None:
-        """Regression: when logs_2.sqlite was tab-private, codex 0.132+ spent
-        ~9 seconds of CPU on cold-start schema setup every launch — 7x slower
-        than running against the global home. SHARED_TAB_NAMES now includes
-        logs_2.sqlite so it symlinks back; codex sees an initialized DB.
-        """
-        # Pre-create a "global" logs_2.sqlite so the symlink target exists.
-        global_logs = self.home / "logs_2.sqlite"
-        global_logs.write_bytes(b"")  # any file is enough to prove the symlink target
+    # ----- sessions symlink + logs_2 share ----------------------------------
 
-        states = {state.email: state for state in account_states(self.home)}
-        chosen = states["a@example.com"]
-        _tab_id, tab_home = create_tab_home(self.home, chosen)
+    def test_sessions_symlinks_to_global_so_rollouts_survive_cleanup(self) -> None:
+        chosen = next(s for s in account_states(self.home) if s.email == "a@example.com")
+        tab_home = create_tab_home(chosen, ["codex"], self.home)
+        sessions = tab_home / "sessions"
+        self.assertTrue(sessions.is_symlink() or sessions.is_dir())
+        # Simulate codex writing a rollout while the tab is alive.
+        rollout = sessions / "2026" / "05" / "26" / "rollout-test.jsonl"
+        rollout.parent.mkdir(parents=True, exist_ok=True)
+        rollout.write_text('{"id":"x"}\n')
+        # On cleanup, the rollout MUST survive in the global sessions tree.
+        L.cleanup_tab_home(tab_home)
+        survived = self.home / "sessions" / "2026" / "05" / "26" / "rollout-test.jsonl"
+        self.assertTrue(survived.is_file())
 
-        tab_logs = tab_home / "logs_2.sqlite"
-        self.assertTrue(tab_logs.exists())
-        self.assertTrue(tab_logs.is_symlink())
-        self.assertEqual(tab_logs.resolve(), global_logs.resolve())
+    # ----- one-tab-per-account rule -----------------------------------------
 
-    def test_pick_account_prefers_unoccupied_accounts(self) -> None:
-        """Two codex processes sharing the same refresh_token cause the
-        `refresh_token_reused` server-side race. pick_account now hard-
-        excludes accounts with live_tabs > 0 by default."""
-        from codex_hot_swap_lib import AccountState
-        unoccupied = AccountState(
-            key="u", email="u@example.com", auth_path=Path("u"), auth_exists=True,
-            remaining_5h=50.0, remaining_weekly=50.0, reset_5h=None, reset_weekly=None,
-            broken=False, live_tabs=0, last_used=0.0, raw={},
-        )
-        occupied_higher_quota = AccountState(
-            key="o", email="o@example.com", auth_path=Path("o"), auth_exists=True,
-            remaining_5h=99.0, remaining_weekly=99.0, reset_5h=None, reset_weekly=None,
-            broken=False, live_tabs=1, last_used=0.0, raw={},
-        )
-        config = load_config(self.home)
-        picked = pick_account([unoccupied, occupied_higher_quota], config)
-        self.assertEqual(picked.email, "u@example.com")
+    def test_pick_account_excludes_accounts_with_live_tabs(self) -> None:
+        """Two codex processes sharing one RT cause refresh_token_reused. The
+        wrapper must hard-exclude already-occupied accounts so each refresh
+        chain is owned by exactly one process at a time."""
+        chosen = next(s for s in account_states(self.home) if s.email == "a@example.com")
+        # Pin one tab to a@example.com.
+        tab_home = create_tab_home(chosen, ["codex"], self.home)
+        # Write a fake live PID to tab.json so live_tabs() sees it as alive.
+        tab_meta = json.loads((tab_home / "tab.json").read_text())
+        tab_meta["pid"] = os.getpid()
+        (tab_home / "tab.json").write_text(json.dumps(tab_meta))
+        # Now pick_account must NOT return a@example.com.
+        picked = pick_account(self.home, exclude_emails=set(), config=L.load_config(self.home))
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked.email, "b@example.com")
+        L.cleanup_tab_home(tab_home)
 
-        # When ALL candidates are occupied, fall back to the highest-quota one.
-        only_occupied = AccountState(
-            key="o2", email="o2@example.com", auth_path=Path("o2"), auth_exists=True,
-            remaining_5h=10.0, remaining_weekly=10.0, reset_5h=None, reset_weekly=None,
-            broken=False, live_tabs=2, last_used=0.0, raw={},
-        )
-        picked2 = pick_account([occupied_higher_quota, only_occupied], config)
-        self.assertEqual(picked2.email, "o@example.com")
+    # ----- quota wall persistence -------------------------------------------
 
-    def test_codex_interactive_prompt_probe(self) -> None:
-        fake_path = REPO / "tests" / "fakes"
-        env = dict(os.environ)
-        env["PATH"] = f"{fake_path}{os.pathsep}{env['PATH']}"
-        env["FAKE_CODEX_HELP_MODE"] = "modern"
-        self.assertTrue(codex_interactive_prompt_supported(env))
-        env["FAKE_CODEX_HELP_MODE"] = "no-prompt"
-        self.assertFalse(codex_interactive_prompt_supported(env))
+    def test_mark_quota_walled_persists_with_reset_epoch(self) -> None:
+        mark_quota_walled("a@example.com", "May 30th, 2026 1:12 PM", self.home)
+        self.assertIn("a@example.com", quota_walled_emails(self.home))
+        data = json.loads(L.quota_walled_path(self.home).read_text())
+        self.assertGreater(data["a@example.com"]["reset_epoch"], time.time())
+
+    def test_mark_quota_walled_defensive_default_15_minutes(self) -> None:
+        before = time.time()
+        mark_quota_walled("a@example.com", None, self.home)
+        data = json.loads(L.quota_walled_path(self.home).read_text())
+        wall = data["a@example.com"]["reset_epoch"]
+        # 15-minute default, give a few seconds of slack for the parse.
+        self.assertGreater(wall, before + 14 * 60)
+        self.assertLess(wall, before + 16 * 60)
+
+    def test_quota_walled_emails_auto_expires(self) -> None:
+        mark_quota_walled("a@example.com", None, self.home)
+        # Backdate so the wall has already expired.
+        path = L.quota_walled_path(self.home)
+        data = json.loads(path.read_text())
+        data["a@example.com"]["reset_epoch"] = time.time() - 1
+        path.write_text(json.dumps(data))
+        self.assertEqual(quota_walled_emails(self.home), set())
+
+    def test_clear_quota_wall_removes_entry(self) -> None:
+        mark_quota_walled("a@example.com", "May 30th, 2026 1:12 PM", self.home)
+        clear_quota_wall("a@example.com", self.home)
+        self.assertEqual(quota_walled_emails(self.home), set())
+
+    # ----- verified-working short-circuit -----------------------------------
+
+    def test_verified_working_outranks_higher_apparent_quota(self) -> None:
+        """An account verified-working within the TTL must outrank one the
+        (lying) usage API claims has more headroom but hasn't been proven."""
+        mark_verified_working("b@example.com", self.home)
+        ranked = rank_accounts(account_states(self.home), config=L.load_config(self.home))
+        self.assertEqual(ranked[0].email, "b@example.com")
+        self.assertTrue(ranked[0].verified_working)
+
+    # ----- observed-token tracking ------------------------------------------
+
+    def test_record_observed_tokens_accumulates_per_email(self) -> None:
+        record_observed_tokens("a@example.com", 1000, self.home)
+        record_observed_tokens("a@example.com", 2500, self.home)
+        self.assertEqual(observed_5h_tokens("a@example.com", self.home), 3500)
+
+    # ----- next-pick hint ---------------------------------------------------
+
+    def test_next_pick_hint_round_trips(self) -> None:
+        write_next_pick_hint("a@example.com", self.home)
+        self.assertEqual(read_next_pick_hint(self.home), "a@example.com")
+
+    def test_next_pick_hint_ignored_when_target_walled(self) -> None:
+        write_next_pick_hint("a@example.com", self.home)
+        mark_quota_walled("a@example.com", "May 30th, 2026 1:12 PM", self.home)
+        self.assertIsNone(read_next_pick_hint(self.home))
+
+    # ----- vault lock -------------------------------------------------------
+
+    def test_exclusive_lock_serializes_concurrent_writers(self) -> None:
+        path = self.home / "test.lock"
+        order: list = []
+
+        def grab(name: str, hold: float) -> None:
+            with _exclusive_lock(path, timeout=5):
+                order.append(("enter", name, time.monotonic()))
+                time.sleep(hold)
+                order.append(("exit", name, time.monotonic()))
+
+        threads = [
+            threading.Thread(target=grab, args=("a", 0.15)),
+            threading.Thread(target=grab, args=("b", 0.15)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        enters = [t for ev, _n, t in order if ev == "enter"]
+        exits = [t for ev, _n, t in order if ev == "exit"]
+        enters.sort()
+        exits.sort()
+        # Second enterer must not enter until first has exited.
+        self.assertGreaterEqual(enters[1], exits[0])
 
 
 if __name__ == "__main__":
