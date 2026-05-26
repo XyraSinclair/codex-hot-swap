@@ -270,6 +270,53 @@ class HotSwapLibTests(unittest.TestCase):
         expected_vault = tab_accounts / f"{_vault_filename_for_key(reg['active_account_key'])}.auth.json"
         self.assertTrue(expected_vault.is_file())
 
+    def test_logs_sqlite_symlinked_into_tab_home(self) -> None:
+        """Regression: when logs_2.sqlite was tab-private, codex 0.132+ spent
+        ~9 seconds of CPU on cold-start schema setup every launch — 7x slower
+        than running against the global home. SHARED_TAB_NAMES now includes
+        logs_2.sqlite so it symlinks back; codex sees an initialized DB.
+        """
+        # Pre-create a "global" logs_2.sqlite so the symlink target exists.
+        global_logs = self.home / "logs_2.sqlite"
+        global_logs.write_bytes(b"")  # any file is enough to prove the symlink target
+
+        states = {state.email: state for state in account_states(self.home)}
+        chosen = states["a@example.com"]
+        _tab_id, tab_home = create_tab_home(self.home, chosen)
+
+        tab_logs = tab_home / "logs_2.sqlite"
+        self.assertTrue(tab_logs.exists())
+        self.assertTrue(tab_logs.is_symlink())
+        self.assertEqual(tab_logs.resolve(), global_logs.resolve())
+
+    def test_pick_account_prefers_unoccupied_accounts(self) -> None:
+        """Two codex processes sharing the same refresh_token cause the
+        `refresh_token_reused` server-side race. pick_account now hard-
+        excludes accounts with live_tabs > 0 by default."""
+        from codex_hot_swap_lib import AccountState
+        unoccupied = AccountState(
+            key="u", email="u@example.com", auth_path=Path("u"), auth_exists=True,
+            remaining_5h=50.0, remaining_weekly=50.0, reset_5h=None, reset_weekly=None,
+            broken=False, live_tabs=0, last_used=0.0, raw={},
+        )
+        occupied_higher_quota = AccountState(
+            key="o", email="o@example.com", auth_path=Path("o"), auth_exists=True,
+            remaining_5h=99.0, remaining_weekly=99.0, reset_5h=None, reset_weekly=None,
+            broken=False, live_tabs=1, last_used=0.0, raw={},
+        )
+        config = load_config(self.home)
+        picked = pick_account([unoccupied, occupied_higher_quota], config)
+        self.assertEqual(picked.email, "u@example.com")
+
+        # When ALL candidates are occupied, fall back to the highest-quota one.
+        only_occupied = AccountState(
+            key="o2", email="o2@example.com", auth_path=Path("o2"), auth_exists=True,
+            remaining_5h=10.0, remaining_weekly=10.0, reset_5h=None, reset_weekly=None,
+            broken=False, live_tabs=2, last_used=0.0, raw={},
+        )
+        picked2 = pick_account([occupied_higher_quota, only_occupied], config)
+        self.assertEqual(picked2.email, "o@example.com")
+
     def test_codex_interactive_prompt_probe(self) -> None:
         fake_path = REPO / "tests" / "fakes"
         env = dict(os.environ)

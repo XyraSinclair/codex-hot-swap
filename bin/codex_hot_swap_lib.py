@@ -45,6 +45,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "notify": True,
 }
 
+# Codex CLI 0.132+ reads several of these from CODEX_HOME on every startup.
+# When a name is in SHARED_TAB_NAMES it's symlinked into the tab from the
+# global home; this is REQUIRED for `sessions/` so rollout JSONLs survive
+# cleanup_tab_home, and REQUIRED for `logs_2.sqlite` so codex doesn't spend
+# ~9 seconds of CPU on cold-start schema setup every time a tab spawns.
+# (logs_2.sqlite is a write-shared logging DB; SQLite WAL mode handles
+# concurrent writers across tabs.)
 SHARED_TAB_NAMES = {
     "config.toml",
     "hooks.json",
@@ -52,6 +59,9 @@ SHARED_TAB_NAMES = {
     "skills",
     "plugins",
     "AGENTS.md",
+    "logs_2.sqlite",
+    "logs_2.sqlite-shm",
+    "logs_2.sqlite-wal",
 }
 
 PRIVATE_TAB_NAMES = {
@@ -60,7 +70,6 @@ PRIVATE_TAB_NAMES = {
     "session_index.jsonl",
     "state.db",
     "state_5.sqlite",
-    "logs_2.sqlite",
     "sqlite",
     "tmp",
     "log",
@@ -566,6 +575,24 @@ def pick_account(
     ]
     if not candidates:
         return None
+
+    # Hard one-tab-per-account rule (default ON; opt out via env).
+    #
+    # Two codex processes sharing the same refresh_token race on token
+    # refresh: whichever loses gets `refresh_token_reused` and the RT chain
+    # for that account is permanently broken until re-OAuth. Per-tab vault
+    # clones narrow but cannot close the window because codex CLI does the
+    # refresh inside its own process, outside any wrapper-side locking.
+    #
+    # Hard-excluding accounts that already have a live tab guarantees there
+    # is never more than one in-flight RT chain per account at any time.
+    # When all candidates are already occupied we relax the rule rather
+    # than starve the new chat — same-account-race is better than no codex.
+    allow_shared = os.environ.get("CODEX_SAFE_ALLOW_SHARED_ACCOUNTS") == "1"
+    if not allow_shared:
+        unoccupied = [s for s in candidates if s.live_tabs == 0]
+        if unoccupied:
+            candidates = unoccupied
 
     def score(state: AccountState) -> tuple[float, int, float, str]:
         return (
