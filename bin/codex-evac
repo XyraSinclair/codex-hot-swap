@@ -33,6 +33,10 @@ import sys
 import time
 from pathlib import Path
 
+# Allow running from a checkout: prefer bin/ next to this script.
+_here = __import__("pathlib").Path(__file__).resolve().parent
+if (_here / "codex_hot_swap_lib.py").is_file():
+    sys.path.insert(0, str(_here))
 
 from codex_hot_swap_lib import (
     codex_base,
@@ -139,11 +143,62 @@ def evac_tab(tab_home: Path, dry_run: bool = False) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("tab_id", nargs="?", help="tab id (or prefix); default = detect from $CODEX_HOME")
-    parser.add_argument("--all-walled", action="store_true", help="evac every live tab pinned to a walled account")
+    parser.add_argument("--all-walled", action="store_true", help="list every live tab pinned to a walled account")
+    parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="resume the most-recent rollout globally (use after you've already exited the walled chat)",
+    )
+    parser.add_argument(
+        "--list-recent",
+        type=int,
+        nargs="?",
+        const=10,
+        help="list the N most-recent rollouts in ~/.codex/sessions/ (default 10)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="show plan only")
     args = parser.parse_args()
 
     base = codex_base()
+
+    if args.list_recent is not None:
+        sessions = base / "sessions"
+        candidates = sorted(
+            sessions.rglob("rollout-*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[: args.list_recent]
+        if not candidates:
+            banner("no rollouts found")
+            return 0
+        banner(f"{len(candidates)} most-recent rollouts:")
+        import datetime as _dt
+        for p in candidates:
+            when = _dt.datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            sys.stderr.write(f"  {when}  {p}\n")
+        sys.stderr.write("\nResume one with: codex-evac --latest   (most recent)\n")
+        sys.stderr.write("Or:              codex resume <path>\n")
+        return 0
+
+    if args.latest:
+        sessions = base / "sessions"
+        candidates = sorted(
+            sessions.rglob("rollout-*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            banner("no rollouts found")
+            return 1
+        rollout = candidates[0]
+        banner(f"resuming most-recent rollout: {rollout.name}")
+        if args.dry_run:
+            return 0
+        try:
+            os.execvp("codex", ["codex", "resume", str(rollout)])
+        except OSError as exc:
+            banner(f"exec failed: {exc}")
+            return 1
 
     if args.all_walled:
         walled = quota_walled_emails(base)
@@ -180,7 +235,13 @@ def main() -> int:
     else:
         tab_home = current_tab_home()
         if tab_home is None:
-            banner("CODEX_HOME does not point at a tab dir; pass a tab_id explicitly")
+            banner("CODEX_HOME does not point at a tab dir.")
+            sys.stderr.write(
+                "\n  Pass a tab_id:   codex-evac <tab_id>\n"
+                "  Or resume latest: codex-evac --latest\n"
+                "  Or list recent:  codex-evac --list-recent\n"
+                "  Or see walled:   codex-evac --all-walled\n"
+            )
             return 1
 
     return evac_tab(tab_home, dry_run=args.dry_run)
