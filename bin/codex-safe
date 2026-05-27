@@ -106,6 +106,26 @@ QUOTA_FAIL_PATTERNS: list[bytes] = [
     rb"Quota exceeded\. Check your plan and billing details",
 ]
 # Capture the "try again at <date time>" tail to know when the wall expires.
+# Codex prints its session id near startup: "session id: <uuid>". We extract
+# it from the ring on failure so the wrapper can re-launch with
+# `codex resume <uuid>` and preserve the chat across account swaps. The user
+# never sees their conversation reset — it just continues on a fresh account.
+SESSION_ID_RE = re.compile(
+    rb"session id:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
+
+
+def extract_session_id(ring: bytes) -> str | None:
+    m = SESSION_ID_RE.search(ring)
+    if not m:
+        return None
+    try:
+        return m.group(1).decode("ascii")
+    except Exception:
+        return None
+
+
 QUOTA_RESET_RE = re.compile(
     rb"try again at\s+([A-Za-z]+ \d+(?:st|nd|rd|th)?,\s*\d{4}\s+\d{1,2}:\d{2}\s*(?:AM|PM))",
     re.IGNORECASE,
@@ -307,6 +327,28 @@ def run_with_pty(argv: list[str], env: dict[str, str], tab_home: Path) -> tuple[
                         pass
                     return (0, "quota", ring)
 
+                # Mid-stream auth-chain detection. The refresh_token_reused
+                # race shows up as "Your access token could not be refreshed
+                # ... refresh token was already used" in codex's output.
+                # Interactive codex prints it but DOESN'T EXIT — the chat
+                # just stays dead. Catching it here lets the wrapper kill
+                # codex, mark the account broken, and relaunch on a fresh
+                # account (via codex resume if there's a rollout) so the
+                # user's chat keeps going instead of being stuck.
+                if (
+                    not DETECTION_DISABLED
+                    and any(p.search(ring[-TAIL_INSPECT_BYTES:]) for p in COMPILED_AUTH)
+                ):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        os.waitpid(pid, 0)
+                    except ChildProcessError:
+                        pass
+                    return (0, "auth", ring)
+
             try:
                 wpid, status = os.waitpid(pid, os.WNOHANG)
                 if wpid == pid:
@@ -411,6 +453,17 @@ def main() -> None:
             banner(f"pinned this tab to {account.email}")
 
         rc, failure, ring = run_with_pty(argv, child_env, tab_home)
+
+        # If codex emitted its session id before failing, capture it so we can
+        # resume the same chat on the next account when retrying. Without
+        # this, an auth/quota swap mid-chat would lose the conversation.
+        captured_session = extract_session_id(ring) if failure else None
+        if captured_session and "resume" not in argv:
+            # Rewrite argv so the next iteration's run_with_pty invokes
+            # `codex resume <sid>`. Insert after argv[0] (the codex bin).
+            argv = [argv[0], "resume", captured_session] + [
+                a for a in argv[1:] if a not in {"resume"}
+            ]
 
         stale_tab_auth = False
         if failure == "auth":
