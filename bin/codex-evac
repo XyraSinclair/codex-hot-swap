@@ -40,6 +40,7 @@ if (_here / "codex_hot_swap_lib.py").is_file():
 from codex_hot_swap_lib import (
     codex_base,
     latest_rollout_for_tab,
+    latest_session_id_for_tab,
     live_tabs,
     quota_walled_emails,
     read_json,
@@ -99,10 +100,18 @@ def evac_tab(tab_home: Path, dry_run: bool = False) -> int:
     pid = meta.get("pid")
     banner(f"tab {tab_home.name[:8]} pinned to {email} (codex pid={pid})")
 
+    # Prefer the authoritative per-tab session id from state_5.sqlite — this
+    # is THIS TAB's current thread, not whatever rollout in the symlinked
+    # global sessions/ happens to be freshest. Fall back to filename parse
+    # only if the DB is unavailable.
+    session_id = latest_session_id_for_tab(tab_home)
     rollout = latest_rollout_for_tab(tab_home)
-    session_id = _session_id_from_rollout(rollout) if rollout else None
-    if rollout is not None:
-        banner(f"will resume rollout: {rollout.name}")
+    if session_id is None and rollout is not None:
+        session_id = _session_id_from_rollout(rollout)
+    if session_id is not None:
+        banner(f"will resume session {session_id} (from tab state DB)")
+    elif rollout is not None:
+        banner(f"will resume rollout: {rollout.name} (fallback — no tab DB)")
     else:
         banner("no rollout found; will start fresh chat (context may be lost)")
 

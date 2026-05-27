@@ -1383,6 +1383,75 @@ def tab_auth_is_stale_against_vault(tab_home: Path, email: str, base: Path | Non
     return vault_marker > tab_marker + 1
 
 
+def latest_session_id_for_tab(tab_home: Path) -> str | None:
+    """Return the session UUID of the tab's most-recently-updated thread.
+
+    THIS is the authoritative per-tab signal. `state_5.sqlite` is tab-private,
+    so a query against it tells us exactly which thread/rollout belongs to
+    THIS tab. Globbing the global sessions/ dir (which is symlinked in for
+    every tab) catches all tabs' rollouts and produces wrong-chat evac.
+    """
+    import sqlite3 as _sql
+    db = tab_home / "state_5.sqlite"
+    if not db.exists():
+        return None
+    try:
+        conn = _sql.connect(f"file:{db}?mode=ro&immutable=1", uri=True, timeout=2)
+    except _sql.Error:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT id FROM threads "
+            "WHERE archived = 0 "
+            "ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC LIMIT 1"
+        ).fetchone()
+    except _sql.Error:
+        row = None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if not row or not row[0]:
+        return None
+    return str(row[0])
+
+
+def latest_rollout_path_from_tab_db(tab_home: Path) -> Path | None:
+    """Return the rollout PATH the tab's state_5.sqlite says is current.
+
+    Distinct from latest_session_id_for_tab in that it reads the actual path
+    field. Useful for sanity-checking the file exists on disk.
+    """
+    import sqlite3 as _sql
+    db = tab_home / "state_5.sqlite"
+    if not db.exists():
+        return None
+    try:
+        conn = _sql.connect(f"file:{db}?mode=ro&immutable=1", uri=True, timeout=2)
+    except _sql.Error:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT rollout_path FROM threads "
+            "WHERE archived = 0 "
+            "ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC LIMIT 1"
+        ).fetchone()
+    except _sql.Error:
+        row = None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if not row or not row[0]:
+        return None
+    p = Path(str(row[0])).expanduser()
+    if not p.is_absolute():
+        p = tab_home / p
+    return p.resolve() if p.exists() else p
+
+
 def latest_rollout_under(path: Path) -> Path | None:
     """Find the freshest rollout-*.jsonl under `path` (recursively).
 
@@ -1406,22 +1475,30 @@ def latest_rollout_under(path: Path) -> Path | None:
 
 
 def latest_rollout_for_tab(tab_home: Path) -> Path | None:
-    """Best-effort rollout-id lookup for live-tab evacuation.
+    """Find THIS tab's current rollout file.
 
-    Strategy:
-      1. Glob tab_home/sessions/ for rollouts. For LEGACY tabs this is a real
-         dir with that tab's rollouts only — perfect match. For new-style
-         tabs sessions/ symlinks to global, so we get all rollouts and pick
-         the freshest, which is usually right for an in-progress chat.
-      2. If sessions/ has no rollouts (very new tab pre-first-message),
-         fall back to scanning global sessions/ for the freshest rollout
-         touched after this tab was created.
+    Strategy (authoritative → fuzzy):
+      1. state_5.sqlite is tab-private. Its `threads` table records the
+         rollout_path for each thread this tab has owned. The most-recently-
+         updated thread is the conversation a user evac'ing this tab wants
+         to resume. This is the ONLY signal that's per-tab; everything else
+         (mtime ordering, sessions/ glob) returns the freshest rollout
+         across ALL tabs and produces wrong-chat evac.
+      2. If state_5.sqlite is unavailable or empty (a brand-new tab that
+         hasn't sent a message yet), fall back to the tab's local
+         sessions/ glob.
+      3. As a last resort, scan the global sessions/ — but log/banner that
+         this is a guess.
     """
+    db_path = latest_rollout_path_from_tab_db(tab_home)
+    if db_path is not None and db_path.exists():
+        return db_path
+    # Fall back to filesystem scan. NOTE: when sessions/ is symlinked to
+    # global, this can return another tab's rollout. We prefer it only when
+    # the tab is too new to have a state_5.sqlite entry.
     direct = latest_rollout_under(tab_home / "sessions")
     if direct is not None:
         return direct
-    # Tab home's sessions/ might not exist yet (very early in the chat) or
-    # the tab.json's mtime could be a coarse hint for what to match.
     base = tab_home.parent.parent  # ~/.codex
     return latest_rollout_under(base / "sessions")
 
@@ -1501,55 +1578,4 @@ def active_state(states: list[AccountState]) -> AccountState | None:
     for state in states:
         if state.active:
             return state
-    return None
-
-
-# ----- backwards-compatibility shims --------------------------------------
-# The pre-v0.2.0 lib exposed a different set of helpers. Keep stubs so that
-# bin/codex-status, bin/codex-validate, bin/codex-continue, and any external
-# scripts that imported the old names still work. The new canonical paths
-# (quota_walled_emails, verified_working_emails, mark_quota_walled, etc.) are
-# the source of truth — these shims dispatch to them where semantics match,
-# or no-op when the concept has been superseded.
-
-def wall_cache_path(home: Path | None = None) -> Path:
-    # Deprecated alias. Quota walls now live in
-    # accounts/recover/quota-walled.json; the old top-level cache file is no
-    # longer written. Return its old path so any reader that just stats it
-    # gets file-not-found rather than a crash.
-    return (home or codex_base()) / "predictive_quota_walls.json"
-
-
-def write_quota_wall_cache(home: Path, states: list) -> dict:
-    """No-op. Walls are now persisted by codex-safe's mid-stream detector
-    into accounts/recover/quota-walled.json with parsed reset epochs."""
-    return {}
-
-
-def codex_interactive_prompt_supported(env: dict | None = None) -> bool:
-    """Probe whether codex CLI's `--help` advertises an interactive prompt
-    flag. The new wrapper does not depend on this probe (it always uses the
-    PTY path), so return True for callers that still ask."""
-    return True
-
-
-def latest_rollout_from_sqlite(tab_home: Path) -> Path | None:
-    """Old helper: locate the latest rollout via state_5.sqlite. With
-    sessions/ symlinked back to the global home, the freshest rollout is
-    reliably the newest mtime under sessions/."""
-    return latest_rollout_for_tab(tab_home)
-
-
-def find_account(states, selector: str):
-    """Match by exact email, then by account_key prefix, then by email substring."""
-    sel = selector.lower()
-    for s in states:
-        if s.email.lower() == sel:
-            return s
-    for s in states:
-        if s.account_key and s.account_key.lower().startswith(sel):
-            return s
-    for s in states:
-        if sel in s.email.lower():
-            return s
     return None
