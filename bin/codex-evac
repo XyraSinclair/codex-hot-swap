@@ -33,7 +33,6 @@ import sys
 import time
 from pathlib import Path
 
-# Allow running from a checkout: prefer bin/ next to this script.
 _here = __import__("pathlib").Path(__file__).resolve().parent
 if (_here / "codex_hot_swap_lib.py").is_file():
     sys.path.insert(0, str(_here))
@@ -235,14 +234,28 @@ def main() -> int:
     else:
         tab_home = current_tab_home()
         if tab_home is None:
-            banner("CODEX_HOME does not point at a tab dir.")
-            sys.stderr.write(
-                "\n  Pass a tab_id:   codex-evac <tab_id>\n"
-                "  Or resume latest: codex-evac --latest\n"
-                "  Or list recent:  codex-evac --list-recent\n"
-                "  Or see walled:   codex-evac --all-walled\n"
+            # No live tab context — the walled codex already exited and
+            # cleaned up its tab dir, OR the user is in a fresh shell.
+            # Either way, the right thing is to resume their most-recent
+            # rollout on a fresh non-walled account. No flag required.
+            sessions = base / "sessions"
+            candidates = sorted(
+                sessions.rglob("rollout-*.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
             )
-            return 1
+            if not candidates:
+                banner("no tab in this shell and no rollouts on disk to resume")
+                return 1
+            rollout = candidates[0]
+            banner(f"no tab context — resuming most-recent rollout: {rollout.name}")
+            if args.dry_run:
+                return 0
+            try:
+                os.execvp("codex", ["codex", "resume", str(rollout)])
+            except OSError as exc:
+                banner(f"exec failed: {exc}")
+                return 1
 
     return evac_tab(tab_home, dry_run=args.dry_run)
 
