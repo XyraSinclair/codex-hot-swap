@@ -59,6 +59,25 @@ def find_tab_by_prefix(prefix: str) -> Path | None:
     return matches[0] if matches else None
 
 
+_SESSION_ID_RE = __import__("re").compile(
+    r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$",
+    __import__("re").IGNORECASE,
+)
+
+
+def _session_id_from_rollout(rollout: Path | None) -> str | None:
+    """Extract codex's session UUID from a rollout filename.
+
+    Filename shape: rollout-<iso>-<uuid>.jsonl
+    `codex resume <uuid>` takes that UUID. Passing the path doesn't work
+    (codex 0.132 errors "No saved session found with ID <path>").
+    """
+    if rollout is None:
+        return None
+    m = _SESSION_ID_RE.search(rollout.name)
+    return m.group(1) if m else None
+
+
 def current_tab_home() -> Path | None:
     """Best-effort: detect the tab home we're running inside via $CODEX_HOME."""
     raw = os.environ.get("CODEX_HOME")
@@ -81,6 +100,7 @@ def evac_tab(tab_home: Path, dry_run: bool = False) -> int:
     banner(f"tab {tab_home.name[:8]} pinned to {email} (codex pid={pid})")
 
     rollout = latest_rollout_for_tab(tab_home)
+    session_id = _session_id_from_rollout(rollout) if rollout else None
     if rollout is not None:
         banner(f"will resume rollout: {rollout.name}")
     else:
@@ -116,11 +136,15 @@ def evac_tab(tab_home: Path, dry_run: bool = False) -> int:
 
     # Re-exec codex via the wrapper. The wrapper will pick a fresh non-walled
     # account on its own via pick_account / next-pick-hint.
-    cmd = ["codex"]
-    if rollout is not None:
-        # codex resume takes a session id (the uuid in the rollout filename)
-        # OR a path to the rollout JSONL. Path is more reliable.
-        cmd = ["codex", "resume", str(rollout)]
+    if session_id:
+        # codex resume takes a UUID, not a path. Extract it from the rollout
+        # filename: rollout-<timestamp>-<uuid>.jsonl. (We confirmed this with
+        # `codex resume --help`: [SESSION_ID] is a UUID or thread name.)
+        cmd = ["codex", "resume", session_id]
+    elif rollout is not None:
+        # We have a rollout but couldn't parse the UUID. Fall back to --last
+        # which lets codex pick the most-recent session by itself.
+        cmd = ["codex", "resume", "--last"]
     else:
         # Fresh chat — the previous conversation context will be lost.
         # Append original argv (minus codex itself) so flags carry over.
@@ -194,7 +218,7 @@ def main() -> int:
         if args.dry_run:
             return 0
         try:
-            os.execvp("codex", ["codex", "resume", str(rollout)])
+            os.execvp("codex", ["codex", "resume", "--last"])
         except OSError as exc:
             banner(f"exec failed: {exc}")
             return 1
@@ -252,7 +276,7 @@ def main() -> int:
             if args.dry_run:
                 return 0
             try:
-                os.execvp("codex", ["codex", "resume", str(rollout)])
+                os.execvp("codex", ["codex", "resume", "--last"])
             except OSError as exc:
                 banner(f"exec failed: {exc}")
                 return 1
